@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Minimal Vercel webhook for a Yandex Alice skill powered by Gemini with optional Serper web search",
   "engines": {
-    "node": ">=22"
+    "node": "22.x"
   },
   "scripts": {
     "test": "node --test"
