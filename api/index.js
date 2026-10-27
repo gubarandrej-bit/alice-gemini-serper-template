@@ -26,7 +26,11 @@ import {
   consumePendingResult,
   generatePendingId,
   getCachedSearchResult,
+  getLastCallMetrics,
+  isModelOnCooldown,
   isUpstashConfigured,
+  markModelCooldown,
+  recordLastCallMetrics,
   registerBackgroundPendingTask,
   setCachedSearchResult
 } from "../lib/cache.js";
@@ -36,12 +40,12 @@ const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const DEFAULT_FALLBACK_MODEL = "gemini-3.1-flash-lite";
 
 // Yandex Dialogs expects the full HTTP round-trip within ~4.5s.
-const TOTAL_RESPONSE_BUDGET_MS = 3850;
-const SERPER_TIMEOUT_MS = 700;
-const MIN_GEMINI_BUDGET_AFTER_SEARCH_MS = 2500;
-const GEMINI_TIMEOUT_MS = 3650;
+const TOTAL_RESPONSE_BUDGET_MS = 4050;
+const SERPER_TIMEOUT_MS = 1200;
+const MIN_GEMINI_BUDGET_AFTER_SEARCH_MS = 2300;
+const GEMINI_TIMEOUT_MS = 3950;
 const BACKGROUND_GEMINI_TIMEOUT_MS = 8800; // Fits safely inside Vercel maxDuration: 10s
-const GEMINI_MAX_OUTPUT_TOKENS = 650;
+const GEMINI_MAX_OUTPUT_TOKENS = 340;
 
 const EXIT_COMMAND_RE = /^(хватит|стоп|выйти|выход|закончить|закройся|завершить|пока|до свидания|все спасибо|всё спасибо)$/i;
 const HELP_COMMAND_RE = /^(помощь|справка|что ты умеешь|что ты можешь|кто ты|инструкция|как пользоваться)$/i;
@@ -55,15 +59,15 @@ const ELABORATE_COMMAND_RE = /^(подробнее|расскажи подроб
 
 const SEARCH_INTENT_RE = new RegExp(
   [
-    "\\b(latest|today|tomorrow|current|news|weather|forecast|price|exchange rate|bitcoin|usd|eur|recent|search|look up|score|schedule|who won|release date)\\b",
-    "сегодня|сейчас|завтра|вчера|на этой неделе|в этом году|202[4-9]|203\\d",
-    "последн|новост|событи|случил|произошл",
+    "\\b(latest|today|tomorrow|current|news|weather|forecast|price|exchange rate|bitcoin|usd|eur|score|schedule|who won|release date|search|look up)\\b",
+    "сегодня|завтра|вчера|на этой неделе|в этом году|202[5-9]|203\\d",
+    "свежи\\S* новост|последни\\S* новост|главны\\S* новост|новост\\S* дня|что случилось|что произошло",
     "погод|температур|прогноз|дождь|снег|ветер|градус",
-    "курс|валют|доллар|евро|рубл|биткоин|юан|акци|ключев\\S* ставк",
-    "сколько стоит|цена|цены|стоимост",
-    "найди|поищи|погугли|актуальн|свежие данные",
-    "кто выиграл|кто победил|счёт|счет|матч|турнир|чемпион",
-    "расписани|пробк|когда выйдет|дата выхода|релиз|кто сейчас"
+    "курс валют|курс доллар|курс евро|курс юан|курс биткоин|сколько стоит доллар|сколько стоит евро|сколько стоит биткоин|ключев\\S* ставк",
+    "сколько стоит|цена на |цены на |стоимост",
+    "найди|поищи|погугли|актуальн\\S* данн|свежие данные",
+    "кто выиграл|кто победил|счёт матча|счет матча|чемпион",
+    "расписани|пробк|когда выйдет|дата выхода|кто сейчас президент|кто сейчас мэр|кто сейчас глава"
   ].join("|"),
   "i"
 );
@@ -200,17 +204,22 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
-async function searchWeb(query, timeoutMs) {
+async function searchWeb(query, timeoutMs, metricsOut = null) {
   const key = process.env.SERPER_API_KEY?.trim();
   if (!key) return "";
 
   const cached = getCachedSearchResult(query);
   if (cached !== null) {
+    if (metricsOut) {
+      metricsOut.serperStatus = "cache_hit";
+      metricsOut.serperMs = 0;
+    }
     return cached;
   }
 
   if (timeoutMs < 150) return "";
 
+  const t0 = Date.now();
   try {
     const { response, data } = await fetchJson(
       "https://google.serper.dev/search",
@@ -224,6 +233,11 @@ async function searchWeb(query, timeoutMs) {
       },
       Math.min(SERPER_TIMEOUT_MS, timeoutMs)
     );
+
+    if (metricsOut) {
+      metricsOut.serperStatus = response.status;
+      metricsOut.serperMs = Date.now() - t0;
+    }
 
     if (!response.ok) {
       console.warn("Serper request failed with HTTP", response.status);
@@ -258,6 +272,10 @@ async function searchWeb(query, timeoutMs) {
     }
     return formatted;
   } catch (error) {
+    if (metricsOut) {
+      metricsOut.serperStatus = isTimeoutError(error) ? "timeout" : "error";
+      metricsOut.serperMs = Date.now() - t0;
+    }
     if (isTimeoutError(error)) {
       console.warn("Serper request timed out; continuing without search.");
     } else {
@@ -273,7 +291,26 @@ function resolveFallbackModel(primaryModel) {
   if (configured && /^[A-Za-z0-9._-]+$/.test(configured) && configured !== primaryModel) {
     return configured;
   }
-  return primaryModel === DEFAULT_FALLBACK_MODEL ? "gemini-3.6-flash" : DEFAULT_FALLBACK_MODEL;
+  return primaryModel === DEFAULT_FALLBACK_MODEL ? "gemini-2.5-flash-lite" : DEFAULT_FALLBACK_MODEL;
+}
+
+function buildModelCandidates(primaryModel) {
+  const fallback = resolveFallbackModel(primaryModel);
+  const raw = [primaryModel];
+  if (fallback) {
+    raw.push(fallback);
+    if (!process.env.GEMINI_FALLBACK_MODEL?.trim()) {
+      raw.push("gemini-2.5-flash-lite");
+    }
+  }
+  const unique = [...new Set(raw.filter(Boolean))];
+  const healthy = unique.filter(m => !isModelOnCooldown(m));
+  const cooled = unique.filter(m => isModelOnCooldown(m));
+  return [...healthy, ...cooled];
+}
+
+function supportsMinimalThinkingLevel(model) {
+  return /^gemini-3\.(1|5|6)-flash/i.test(model);
 }
 
 async function callSingleGeminiModel({
@@ -284,13 +321,19 @@ async function callSingleGeminiModel({
   useGoogleGrounding,
   timeoutMs
 }) {
+  const generationConfig = {
+    temperature: 0.4,
+    maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS
+  };
+
+  if (supportsMinimalThinkingLevel(model)) {
+    generationConfig.thinkingConfig = { thinkingLevel: "MINIMAL" };
+  }
+
   const requestBody = {
     systemInstruction: { parts: [{ text: systemText }] },
     contents,
-    generationConfig: {
-      temperature: 0.5,
-      maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS
-    }
+    generationConfig
   };
 
   if (useGoogleGrounding) {
@@ -319,7 +362,8 @@ async function askGemini({
   timezone,
   mode = "assistant",
   userProfile = {},
-  useGoogleGrounding = false
+  useGoogleGrounding = false,
+  metricsOut = null
 }) {
   const key = process.env.GEMINI_API_KEY?.trim();
   if (!key) throw new Error("MISSING_GEMINI_KEY");
@@ -357,49 +401,98 @@ async function askGemini({
   const startedAt = Date.now();
   const timeLeft = () => timeoutMs - (Date.now() - startedAt);
 
-  let { response, data } = await callSingleGeminiModel({
-    model: primaryModel,
-    key,
-    systemText,
-    contents,
-    useGoogleGrounding,
-    timeoutMs: timeLeft()
-  });
+  const candidates = buildModelCandidates(primaryModel);
+  const attempts = [];
+  let lastResponse = null;
+  let lastData = null;
+  let attachGrounding = useGoogleGrounding;
 
-  // If grounding tool caused a 400 validation error on this key/model, retry cleanly without tools
-  if (!response.ok && useGoogleGrounding && response.status === 400 && timeLeft() >= 700) {
-    const apiMsg = String(data?.error?.message || "");
-    if (!/API_KEY_INVALID|API key not valid|location is not supported|free tier is not available/i.test(apiMsg)) {
-      console.warn("Retrying Gemini without google_search grounding tool after HTTP 400");
-      ({ response, data } = await callSingleGeminiModel({
-        model: primaryModel,
+  for (let idx = 0; idx < candidates.length; idx++) {
+    const candidateModel = candidates[idx];
+    if (idx > 0 && timeLeft() < 650) break;
+
+    const stepStart = Date.now();
+    // Cap individual attempt when another healthy fallback exists so one stalled model doesn't eat 8.8s
+    const hasMoreFallbacks = idx < candidates.length - 1;
+    const perAttemptTimeout = hasMoreFallbacks ? Math.min(timeLeft(), 3200) : timeLeft();
+
+    try {
+      let { response, data } = await callSingleGeminiModel({
+        model: candidateModel,
         key,
         systemText,
         contents,
-        useGoogleGrounding: false,
-        timeoutMs: timeLeft()
-      }));
+        useGoogleGrounding: attachGrounding,
+        timeoutMs: perAttemptTimeout
+      });
+
+      attempts.push({ model: candidateModel, status: response.status, ms: Date.now() - stepStart, grounded: attachGrounding });
+      lastResponse = response;
+      lastData = data;
+
+      if (response.ok) {
+        break;
+      }
+
+      const apiMsg = String(data?.error?.message || "");
+      // Hard auth / region errors fail immediately — retrying another model won't help
+      if (
+        response.status === 401 ||
+        response.status === 403 ||
+        /API_KEY_INVALID|API key not valid|location is not supported|free tier is not available/i.test(apiMsg)
+      ) {
+        break;
+      }
+
+      // If grounding tool itself caused 400 or 429, drop grounding for subsequent retry
+      if (attachGrounding && (response.status === 400 || response.status === 429)) {
+        attachGrounding = false;
+        if (response.status === 400 && timeLeft() >= 650) {
+          const retryStart = Date.now();
+          ({ response, data } = await callSingleGeminiModel({
+            model: candidateModel,
+            key,
+            systemText,
+            contents,
+            useGoogleGrounding: false,
+            timeoutMs: timeLeft()
+          }));
+          attempts.push({ model: candidateModel, status: response.status, ms: Date.now() - retryStart, grounded: false });
+          lastResponse = response;
+          lastData = data;
+          if (response.ok) break;
+        }
+      }
+
+      // Put quota-exhausted (429), missing (404), or overloaded (5xx) model on cooldown so next user request skips it immediately!
+      if (response.status === 429 || response.status >= 500) {
+        markModelCooldown(candidateModel, 3 * 60 * 1000);
+        console.warn(`Primary model ${candidateModel} returned HTTP ${response.status}; falling back to ${candidates[idx + 1] || "none"}`);
+      } else if (response.status === 404) {
+        markModelCooldown(candidateModel, 30 * 60 * 1000);
+      } else {
+        break;
+      }
+    } catch (stepErr) {
+      const elapsed = Date.now() - stepStart;
+      attempts.push({ model: candidateModel, status: isTimeoutError(stepErr) ? "timeout" : "error", ms: elapsed });
+      if (isTimeoutError(stepErr) && hasMoreFallbacks && timeLeft() >= 900) {
+        markModelCooldown(candidateModel, 90 * 1000);
+        attachGrounding = false;
+        continue;
+      }
+      if (metricsOut) metricsOut.geminiAttempts = attempts;
+      throw stepErr;
     }
   }
 
-  // Auto-fallback to secondary model on quota (429), model missing (404), or transient 5xx overload
-  if (!response.ok && (response.status === 429 || response.status === 404 || response.status >= 500) && timeLeft() >= 700) {
-    const fallbackModel = resolveFallbackModel(primaryModel);
-    if (fallbackModel) {
-      console.warn(`Primary model ${primaryModel} returned HTTP ${response.status}; falling back to ${fallbackModel}`);
-      ({ response, data } = await callSingleGeminiModel({
-        model: fallbackModel,
-        key,
-        systemText,
-        contents,
-        useGoogleGrounding,
-        timeoutMs: timeLeft()
-      }));
-    }
-  }
+  if (metricsOut) metricsOut.geminiAttempts = attempts;
 
-  if (!response.ok) {
-    const status = Number(response.status);
+  const response = lastResponse;
+  const data = lastData;
+
+  if (!response || !response.ok) {
+    const status = Number(response?.status || 500);
     const apiMessage = String(data?.error?.message || "");
     const apiStatus = String(data?.error?.status || "");
     console.error("Gemini request failed with HTTP", status, apiStatus);
@@ -536,7 +629,8 @@ function buildDiagnosticsPayload() {
       asyncCacheMode: isUpstashConfigured() ? "upstash_redis" : "memory",
       rateLimitPerMinute: rateLimitPerMinute > 0 ? rateLimitPerMinute : 0,
       skillIdProtected: Boolean(process.env.ALICE_SKILL_ID?.trim()),
-      webhookSecretProtected: Boolean(process.env.WEBHOOK_SECRET?.trim())
+      webhookSecretProtected: Boolean(process.env.WEBHOOK_SECRET?.trim()),
+      lastCallMetrics: getLastCallMetrics()
     }
   };
 }
@@ -804,6 +898,14 @@ export default async function handler(req, res) {
   }
 
   // 12. Main search + Gemini pipeline (with soft deadline + background waitUntil support)
+  const callMetrics = {
+    serperStatus: "skipped",
+    serperMs: 0,
+    geminiAttempts: [],
+    deferredToBackground: false,
+    totalMs: 0
+  };
+
   try {
     let searchContext = "";
     const needsFreshness = isSearchIntent(effectiveText, currentMode);
@@ -815,7 +917,7 @@ export default async function handler(req, res) {
         Math.max(0, remainingMs() - MIN_GEMINI_BUDGET_AFTER_SEARCH_MS)
       );
       const searchQuery = buildSearchQuery(effectiveText, oldHistory, userProfile);
-      searchContext = await searchWeb(searchQuery, searchBudgetMs);
+      searchContext = await searchWeb(searchQuery, searchBudgetMs, callMetrics);
     }
 
     const useGoogleGrounding =
@@ -839,7 +941,8 @@ export default async function handler(req, res) {
       timezone: body?.meta?.timezone,
       mode: currentMode,
       userProfile,
-      useGoogleGrounding
+      useGoogleGrounding,
+      metricsOut: callMetrics
     });
 
     let raceWinner;
@@ -862,8 +965,19 @@ export default async function handler(req, res) {
     }
 
     if (raceWinner.timedOutSoft) {
+      callMetrics.deferredToBackground = true;
+      callMetrics.totalMs = Date.now() - startedAt;
+      recordLastCallMetrics(callMetrics);
+
       const pendingId = generatePendingId();
-      registerBackgroundPendingTask(pendingId, effectiveText, geminiPromise);
+      registerBackgroundPendingTask(
+        pendingId,
+        effectiveText,
+        geminiPromise.finally(() => {
+          callMetrics.backgroundFinishedMs = Date.now() - startedAt;
+          recordLastCallMetrics(callMetrics);
+        })
+      );
 
       return res.status(200).json(
         aliceResponse(
@@ -881,6 +995,9 @@ export default async function handler(req, res) {
         )
       );
     }
+
+    callMetrics.totalMs = Date.now() - startedAt;
+    recordLastCallMetrics(callMetrics);
 
     const answer = raceWinner.answer;
     const split = splitAliceAnswer(answer);
