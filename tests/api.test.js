@@ -47,6 +47,7 @@ const ENV_KEYS = [
   "RATE_LIMIT_PER_MINUTE",
   "ASYNC_PENDING",
   "SOFT_DEADLINE_MS",
+  "GEMINI_HEDGE_DELAY_MS",
   "UPSTASH_REDIS_REST_URL",
   "UPSTASH_REDIS_REST_TOKEN"
 ];
@@ -754,3 +755,118 @@ test("per-user sliding-window rate limiter protects Gemini quota while keeping l
     }
   );
 });
+
+test("staggered hedged race wins with fast backup model when primary model stalls and aborts slow slot", async () => {
+  let primaryAborted = false;
+
+  await withMockEnvAndFetch(
+    {
+      GEMINI_API_KEY: "gemini-test",
+      GEMINI_MODEL: "gemini-3.5-flash-lite",
+      GEMINI_FALLBACK_MODEL: "gemini-3.1-flash-lite",
+      GEMINI_HEDGE_DELAY_MS: "50"
+    },
+    async (url, options) => {
+      if (String(url).includes("gemini-3.5-flash-lite")) {
+        await new Promise((resolve, reject) => {
+          const t = setTimeout(resolve, 400);
+          options.signal?.addEventListener("abort", () => {
+            primaryAborted = true;
+            clearTimeout(t);
+            const abortErr = new Error("AbortError");
+            abortErr.name = "AbortError";
+            reject(abortErr);
+          });
+        });
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { candidates: [{ content: { parts: [{ text: "Медленный ответ." }] } }] };
+          }
+        };
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 20));
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            usageMetadata: { thoughtsTokenCount: 0, candidatesTokenCount: 12 },
+            candidates: [{ content: { parts: [{ text: "Быстрый ответ от дублёра!" }] } }]
+          };
+        }
+      };
+    },
+    async () => {
+      const start = Date.now();
+      const res = createMockRes();
+      await handler({ method: "POST", body: { request: { command: "назови столицу франции" } } }, res);
+      const elapsed = Date.now() - start;
+
+      assert.equal(res.payload.response.text, "Быстрый ответ от дублёра!");
+      assert.ok(elapsed < 250, `Hedged backup should win well before 400ms stall, took ${elapsed}ms`);
+      assert.equal(primaryAborted, true, "Stalled primary request should be aborted once hedged winner finishes");
+
+      const diagRes = createMockRes();
+      await handler({ method: "GET" }, diagRes);
+      assert.equal(diagRes.payload.status.lastCallMetrics.deferredToBackground, false);
+      assert.ok(
+        diagRes.payload.status.lastCallMetrics.geminiAttempts.some(
+          a => a.model === "gemini-3.1-flash-lite" && a.winner === true
+        )
+      );
+    }
+  );
+});
+
+test("model cooldown circuit breaker skips 429 model on subsequent requests and enforces MINIMAL thinkingLevel", async () => {
+  const calledModels = [];
+  const thinkingConfigs = [];
+
+  await withMockEnvAndFetch(
+    {
+      GEMINI_API_KEY: "gemini-test",
+      GEMINI_MODEL: "gemini-3.5-flash-lite",
+      GEMINI_FALLBACK_MODEL: "gemini-3.1-flash-lite"
+    },
+    async (url, options) => {
+      const body = JSON.parse(options.body);
+      thinkingConfigs.push(body?.generationConfig?.thinkingConfig);
+      if (String(url).includes("gemini-3.5-flash-lite")) {
+        calledModels.push("gemini-3.5-flash-lite");
+        return {
+          ok: false,
+          status: 429,
+          async json() {
+            return { error: { status: "RESOURCE_EXHAUSTED", message: "Quota exceeded" } };
+          }
+        };
+      }
+      calledModels.push("gemini-3.1-flash-lite");
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { candidates: [{ content: { parts: [{ text: "Мгновенный ответ без 429." }] } }] };
+        }
+      };
+    },
+    async () => {
+      // Request 1: hits 429 on 3.5-flash-lite, puts it on cooldown, succeeds on 3.1-flash-lite
+      const r1 = createMockRes();
+      await handler({ method: "POST", body: { request: { command: "сколько планет в солнечной системе" } } }, r1);
+      assert.equal(r1.payload.response.text, "Мгновенный ответ без 429.");
+      assert.deepEqual(calledModels, ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]);
+
+      // Request 2: immediately skips cooled-down 3.5-flash-lite and goes straight to 3.1-flash-lite!
+      const r2 = createMockRes();
+      await handler({ method: "POST", body: { request: { command: "какая самая большая планета" } } }, r2);
+      assert.equal(r2.payload.response.text, "Мгновенный ответ без 429.");
+      assert.deepEqual(calledModels, ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.1-flash-lite"]);
+      assert.deepEqual(thinkingConfigs[0], { thinkingLevel: "MINIMAL" });
+    }
+  );
+});
+

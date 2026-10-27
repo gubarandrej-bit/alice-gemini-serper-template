@@ -36,16 +36,17 @@ import {
 } from "../lib/cache.js";
 import { checkRateLimit, clearRateLimitForTests, extractClientKey } from "../lib/rateLimit.js";
 
-const DEFAULT_MODEL = "gemini-3.5-flash-lite";
-const DEFAULT_FALLBACK_MODEL = "gemini-3.1-flash-lite";
+const DEFAULT_MODEL = "gemini-3.1-flash-lite";
+const DEFAULT_FALLBACK_MODEL = "gemini-3.5-flash-lite";
+const TERTIARY_FALLBACK_MODEL = "gemini-3.6-flash";
 
 // Yandex Dialogs expects the full HTTP round-trip within ~4.5s.
-const TOTAL_RESPONSE_BUDGET_MS = 4050;
-const SERPER_TIMEOUT_MS = 1200;
+const TOTAL_RESPONSE_BUDGET_MS = 4150;
+const SERPER_TIMEOUT_MS = 1250;
 const MIN_GEMINI_BUDGET_AFTER_SEARCH_MS = 2300;
-const GEMINI_TIMEOUT_MS = 3950;
-const BACKGROUND_GEMINI_TIMEOUT_MS = 8800; // Fits safely inside Vercel maxDuration: 10s
-const GEMINI_MAX_OUTPUT_TOKENS = 340;
+const GEMINI_TIMEOUT_MS = 4050;
+const BACKGROUND_GEMINI_TIMEOUT_MS = 9400; // Fits safely inside Vercel maxDuration: 10s
+const GEMINI_MAX_OUTPUT_TOKENS = 280;
 
 const EXIT_COMMAND_RE = /^(хватит|стоп|выйти|выход|закончить|закройся|завершить|пока|до свидания|все спасибо|всё спасибо)$/i;
 const HELP_COMMAND_RE = /^(помощь|справка|что ты умеешь|что ты можешь|кто ты|инструкция|как пользоваться)$/i;
@@ -174,20 +175,37 @@ function isTimeoutError(error) {
   );
 }
 
-async function fetchJson(url, options, timeoutMs) {
+async function fetchJson(url, options, timeoutMs, externalSignal = null) {
+  if (externalSignal?.aborted) {
+    throw new Error("HEDGE_CANCELLED");
+  }
+
   const budget = Math.floor(Number(timeoutMs) || 0);
   if (budget < 100) {
     throw new Error("TIME_BUDGET_EXHAUSTED");
   }
 
   const controller = new AbortController();
+  let abortedExternally = false;
+  const onExternalAbort = () => {
+    abortedExternally = true;
+    controller.abort();
+  };
+  if (externalSignal) {
+    externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+  }
+
   const timer = setTimeout(() => controller.abort(), budget);
+  timer.unref?.();
   try {
     const response = await fetch(url, { ...options, signal: controller.signal });
     let data = {};
     try {
       data = await response.json();
     } catch (parseError) {
+      if (abortedExternally || externalSignal?.aborted) {
+        throw new Error("HEDGE_CANCELLED");
+      }
       if (controller.signal.aborted || isTimeoutError(parseError)) {
         throw new Error("TIME_BUDGET_EXHAUSTED");
       }
@@ -195,12 +213,18 @@ async function fetchJson(url, options, timeoutMs) {
     }
     return { response, data };
   } catch (error) {
+    if (error?.message === "HEDGE_CANCELLED" || abortedExternally || externalSignal?.aborted) {
+      throw new Error("HEDGE_CANCELLED");
+    }
     if (controller.signal.aborted || isTimeoutError(error)) {
       throw new Error("TIME_BUDGET_EXHAUSTED");
     }
     throw error;
   } finally {
     clearTimeout(timer);
+    if (externalSignal) {
+      externalSignal.removeEventListener("abort", onExternalAbort);
+    }
   }
 }
 
@@ -247,21 +271,21 @@ async function searchWeb(query, timeoutMs, metricsOut = null) {
     const items = [];
     const answerBox = data?.answerBox?.answer || data?.answerBox?.snippet;
     if (answerBox) {
-      items.push(`Краткий ответ поисковика: ${truncateSafe(answerBox, 350)}`);
+      items.push(`Краткий ответ поисковика: ${truncateSafe(answerBox, 260)}`);
     }
 
     const kgDescription = data?.knowledgeGraph?.description;
     if (kgDescription) {
       const kgTitle = data?.knowledgeGraph?.title ? `${data.knowledgeGraph.title}: ` : "";
-      items.push(`Справка: ${truncateSafe(`${kgTitle}${kgDescription}`, 300)}`);
+      items.push(`Справка: ${truncateSafe(`${kgTitle}${kgDescription}`, 220)}`);
     }
 
     const organic = Array.isArray(data?.organic) ? data.organic.slice(0, 3) : [];
     for (let i = 0; i < organic.length; i++) {
       const item = organic[i] || {};
-      const title = truncateSafe(item.title || "", 160);
-      const snippet = truncateSafe(item.snippet || "", 320);
-      const date = item.date ? ` (${truncateSafe(item.date, 40)})` : "";
+      const title = truncateSafe(item.title || "", 120);
+      const snippet = truncateSafe(item.snippet || "", 210);
+      const date = item.date ? ` (${truncateSafe(item.date, 32)})` : "";
       const line = `${i + 1}. ${title}${date}: ${snippet}`.trim();
       if (title || snippet) items.push(line);
     }
@@ -291,7 +315,7 @@ function resolveFallbackModel(primaryModel) {
   if (configured && /^[A-Za-z0-9._-]+$/.test(configured) && configured !== primaryModel) {
     return configured;
   }
-  return primaryModel === DEFAULT_FALLBACK_MODEL ? "gemini-2.5-flash-lite" : DEFAULT_FALLBACK_MODEL;
+  return primaryModel === DEFAULT_FALLBACK_MODEL ? DEFAULT_MODEL : DEFAULT_FALLBACK_MODEL;
 }
 
 function buildModelCandidates(primaryModel) {
@@ -300,7 +324,7 @@ function buildModelCandidates(primaryModel) {
   if (fallback) {
     raw.push(fallback);
     if (!process.env.GEMINI_FALLBACK_MODEL?.trim()) {
-      raw.push("gemini-2.5-flash-lite");
+      raw.push(TERTIARY_FALLBACK_MODEL);
     }
   }
   const unique = [...new Set(raw.filter(Boolean))];
@@ -309,8 +333,17 @@ function buildModelCandidates(primaryModel) {
   return [...healthy, ...cooled];
 }
 
-function supportsMinimalThinkingLevel(model) {
-  return /^gemini-3\.(1|5|6)-flash/i.test(model);
+function buildThinkingConfig(model) {
+  if (/^gemini-(3\.8-flash|3\.1-pro|4)/i.test(model)) {
+    return { thinkingLevel: "LOW" };
+  }
+  if (/^gemini-3(\.(1|5|6))?-flash/i.test(model)) {
+    return { thinkingLevel: "MINIMAL" };
+  }
+  if (/^gemini-2\.5-flash/i.test(model)) {
+    return { thinkingBudget: 0 };
+  }
+  return null;
 }
 
 async function callSingleGeminiModel({
@@ -319,15 +352,17 @@ async function callSingleGeminiModel({
   systemText,
   contents,
   useGoogleGrounding,
-  timeoutMs
+  timeoutMs,
+  signal = null
 }) {
   const generationConfig = {
     temperature: 0.4,
     maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS
   };
 
-  if (supportsMinimalThinkingLevel(model)) {
-    generationConfig.thinkingConfig = { thinkingLevel: "MINIMAL" };
+  const thinkingConfig = buildThinkingConfig(model);
+  if (thinkingConfig) {
+    generationConfig.thinkingConfig = thinkingConfig;
   }
 
   const requestBody = {
@@ -350,8 +385,52 @@ async function callSingleGeminiModel({
       },
       body: JSON.stringify(requestBody)
     },
-    timeoutMs
+    timeoutMs,
+    signal
   );
+}
+
+function extractCandidateAnswer(data) {
+  const candidate = data?.candidates?.[0];
+  return (candidate?.content?.parts || [])
+    .filter(part => part && !part.thought && typeof part.text === "string")
+    .map(part => part.text)
+    .join("")
+    .trim();
+}
+
+function classifyHttpFailure(response, data) {
+  const status = Number(response?.status || 500);
+  const apiMessage = String(data?.error?.message || "");
+  const apiStatus = String(data?.error?.status || "");
+  console.error("Gemini request failed with HTTP", status, apiStatus);
+  if (status === 401 || status === 403 || /API_KEY_INVALID|API key not valid/i.test(apiMessage)) {
+    return new Error("GEMINI_KEY_REJECTED");
+  }
+  if (status === 400 && (apiStatus === "FAILED_PRECONDITION" || /location is not supported|free tier is not available/i.test(apiMessage))) {
+    return new Error("GEMINI_REGION_RESTRICTED");
+  }
+  if (status === 404) return new Error("INVALID_MODEL_NAME");
+  if (status === 429) return new Error("GEMINI_QUOTA");
+  return new Error("GEMINI_REQUEST_FAILED");
+}
+
+function classifyEmptyResponse(data) {
+  const candidate = data?.candidates?.[0];
+  if (data?.promptFeedback?.blockReason || candidate?.finishReason === "SAFETY") {
+    return new Error("GEMINI_BLOCKED");
+  }
+  return new Error("GEMINI_EMPTY_RESPONSE");
+}
+
+function resolveHedgeDelayMs(hasSearchContext) {
+  const raw = process.env.GEMINI_HEDGE_DELAY_MS?.trim();
+  if (raw === "0" || raw === "false" || raw === "off") return Infinity;
+  if (raw) {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed >= 50) return parsed;
+  }
+  return hasSearchContext ? 450 : 850;
 }
 
 async function askGemini({
@@ -402,125 +481,210 @@ async function askGemini({
   const timeLeft = () => timeoutMs - (Date.now() - startedAt);
 
   const candidates = buildModelCandidates(primaryModel);
+  const hedgeDelayMs = resolveHedgeDelayMs(Boolean(searchContext));
   const attempts = [];
-  let lastResponse = null;
-  let lastData = null;
-  let attachGrounding = useGoogleGrounding;
 
-  for (let idx = 0; idx < candidates.length; idx++) {
-    const candidateModel = candidates[idx];
-    if (idx > 0 && timeLeft() < 650) break;
+  const winnerResult = await new Promise((resolve, reject) => {
+    let nextIdx = 0;
+    let inFlight = 0;
+    let settled = false;
+    let attachGrounding = useGoogleGrounding;
+    let lastHttpFailure = null;
+    let lastError = null;
+    const timers = [];
+    const controllers = [];
 
-    const stepStart = Date.now();
-    // Cap individual attempt when another healthy fallback exists so one stalled model doesn't eat 8.8s
-    const hasMoreFallbacks = idx < candidates.length - 1;
-    const perAttemptTimeout = hasMoreFallbacks ? Math.min(timeLeft(), 3200) : timeLeft();
+    const cleanup = winnerSlot => {
+      while (timers.length > 0) {
+        clearTimeout(timers.pop());
+      }
+      for (let i = 0; i < controllers.length; i++) {
+        if (i !== winnerSlot && controllers[i]) {
+          try {
+            controllers[i].abort();
+          } catch {
+            // ignore abort error
+          }
+        }
+      }
+    };
 
-    try {
-      let { response, data } = await callSingleGeminiModel({
-        model: candidateModel,
-        key,
-        systemText,
-        contents,
-        useGoogleGrounding: attachGrounding,
-        timeoutMs: perAttemptTimeout
-      });
+    const maybeFinishWithFailure = () => {
+      if (settled || inFlight > 0) return;
+      if (nextIdx < candidates.length && timeLeft() >= 350) {
+        launchNextSlot();
+        return;
+      }
+      settled = true;
+      cleanup(-1);
+      if (lastHttpFailure) {
+        reject(classifyHttpFailure(lastHttpFailure.response, lastHttpFailure.data));
+      } else {
+        reject(lastError || new Error("TIME_BUDGET_EXHAUSTED"));
+      }
+    };
 
-      attempts.push({ model: candidateModel, status: response.status, ms: Date.now() - stepStart, grounded: attachGrounding });
-      lastResponse = response;
-      lastData = data;
+    const scheduleHedgeTimer = delayMs => {
+      if (!Number.isFinite(delayMs) || nextIdx >= candidates.length || settled) return;
+      const t = setTimeout(() => {
+        if (settled || nextIdx >= candidates.length) return;
+        if (timeLeft() >= 650) {
+          launchNextSlot();
+        }
+      }, delayMs);
+      t.unref?.();
+      timers.push(t);
+    };
 
-      if (response.ok) {
-        break;
+    const launchNextSlot = () => {
+      if (settled || nextIdx >= candidates.length) return;
+      const remaining = timeLeft();
+      if (remaining < 250) {
+        if (inFlight === 0) {
+          settled = true;
+          cleanup(-1);
+          reject(lastError || new Error("TIME_BUDGET_EXHAUSTED"));
+        }
+        return;
       }
 
-      const apiMsg = String(data?.error?.message || "");
-      // Hard auth / region errors fail immediately — retrying another model won't help
-      if (
-        response.status === 401 ||
-        response.status === 403 ||
-        /API_KEY_INVALID|API key not valid|location is not supported|free tier is not available/i.test(apiMsg)
-      ) {
-        break;
+      const slotIdx = nextIdx++;
+      const slotModel = candidates[slotIdx];
+      const slotGrounded = attachGrounding;
+      const slotController = new AbortController();
+      controllers[slotIdx] = slotController;
+      inFlight += 1;
+      const slotStart = Date.now();
+
+      // Schedule staggered hedge backup while keeping primary request alive
+      if (slotIdx === 0 && nextIdx < candidates.length) {
+        scheduleHedgeTimer(hedgeDelayMs);
+      } else if (slotIdx === 1 && nextIdx < candidates.length) {
+        scheduleHedgeTimer(Math.max(1300, hedgeDelayMs * 2));
       }
 
-      // If grounding tool itself caused 400 or 429, drop grounding for subsequent retry
-      if (attachGrounding && (response.status === 400 || response.status === 429)) {
-        attachGrounding = false;
-        if (response.status === 400 && timeLeft() >= 650) {
-          const retryStart = Date.now();
-          ({ response, data } = await callSingleGeminiModel({
-            model: candidateModel,
+      (async () => {
+        try {
+          let { response, data } = await callSingleGeminiModel({
+            model: slotModel,
             key,
             systemText,
             contents,
-            useGoogleGrounding: false,
-            timeoutMs: timeLeft()
-          }));
-          attempts.push({ model: candidateModel, status: response.status, ms: Date.now() - retryStart, grounded: false });
-          lastResponse = response;
-          lastData = data;
-          if (response.ok) break;
-        }
-      }
+            useGoogleGrounding: slotGrounded,
+            timeoutMs: remaining,
+            signal: slotController.signal
+          });
 
-      // Put quota-exhausted (429), missing (404), or overloaded (5xx) model on cooldown so next user request skips it immediately!
-      if (response.status === 429 || response.status >= 500) {
-        markModelCooldown(candidateModel, 3 * 60 * 1000);
-        console.warn(`Primary model ${candidateModel} returned HTTP ${response.status}; falling back to ${candidates[idx + 1] || "none"}`);
-      } else if (response.status === 404) {
-        markModelCooldown(candidateModel, 30 * 60 * 1000);
-      } else {
-        break;
-      }
-    } catch (stepErr) {
-      const elapsed = Date.now() - stepStart;
-      attempts.push({ model: candidateModel, status: isTimeoutError(stepErr) ? "timeout" : "error", ms: elapsed });
-      if (isTimeoutError(stepErr) && hasMoreFallbacks && timeLeft() >= 900) {
-        markModelCooldown(candidateModel, 90 * 1000);
-        attachGrounding = false;
-        continue;
-      }
-      if (metricsOut) metricsOut.geminiAttempts = attempts;
-      throw stepErr;
-    }
-  }
+          // Single-model grounding 400 retry without grounding
+          if (!response.ok && slotGrounded && response.status === 400 && candidates.length === 1 && timeLeft() >= 500 && !settled) {
+            attachGrounding = false;
+            ({ response, data } = await callSingleGeminiModel({
+              model: slotModel,
+              key,
+              systemText,
+              contents,
+              useGoogleGrounding: false,
+              timeoutMs: timeLeft(),
+              signal: slotController.signal
+            }));
+          }
+
+          const metricEntry = {
+            model: slotModel,
+            status: response.status,
+            ms: Date.now() - slotStart,
+            grounded: slotGrounded,
+            hedged: slotIdx > 0,
+            thoughtsTokens: data?.usageMetadata?.thoughtsTokenCount ?? 0,
+            outputTokens: data?.usageMetadata?.candidatesTokenCount ?? 0
+          };
+          attempts.push(metricEntry);
+
+          if (settled) return;
+
+          if (response.ok) {
+            const answer = extractCandidateAnswer(data);
+            if (answer) {
+              settled = true;
+              metricEntry.winner = true;
+              // If primary model stalled >2s and hedged backup beat it, cool down primary briefly so subsequent turns hit the fast pool directly
+              if (slotIdx > 0 && Date.now() - startedAt >= 2000) {
+                markModelCooldown(candidates[0], 45 * 1000);
+              }
+              cleanup(slotIdx);
+              resolve({ answer, data });
+              return;
+            }
+            lastError = classifyEmptyResponse(data);
+            if (nextIdx < candidates.length && timeLeft() >= 500) {
+              launchNextSlot();
+            }
+            return;
+          }
+
+          const apiMsg = String(data?.error?.message || "");
+          const apiStatus = String(data?.error?.status || "");
+          // Hard auth / region failures abort all slots immediately
+          if (
+            response.status === 401 ||
+            response.status === 403 ||
+            /API_KEY_INVALID|API key not valid/i.test(apiMsg) ||
+            (response.status === 400 && (apiStatus === "FAILED_PRECONDITION" || /location is not supported|free tier is not available/i.test(apiMsg)))
+          ) {
+            settled = true;
+            cleanup(-1);
+            reject(classifyHttpFailure(response, data));
+            return;
+          }
+
+          if (slotGrounded && (response.status === 400 || response.status === 429)) {
+            attachGrounding = false;
+          }
+
+          if (response.status === 429 || response.status >= 500) {
+            markModelCooldown(slotModel, 3 * 60 * 1000);
+            console.warn(`Model ${slotModel} returned HTTP ${response.status}; switching to next candidate`);
+          } else if (response.status === 404) {
+            markModelCooldown(slotModel, 30 * 60 * 1000);
+          }
+
+          lastHttpFailure = { response, data };
+          if (nextIdx < candidates.length && timeLeft() >= 350) {
+            launchNextSlot();
+          }
+        } catch (err) {
+          if (err?.message === "HEDGE_CANCELLED") {
+            attempts.push({ model: slotModel, status: "cancelled_by_winner", ms: Date.now() - slotStart, hedged: slotIdx > 0 });
+            return;
+          }
+          const elapsed = Date.now() - slotStart;
+          attempts.push({
+            model: slotModel,
+            status: isTimeoutError(err) ? "timeout" : "error",
+            ms: elapsed,
+            hedged: slotIdx > 0
+          });
+          if (isTimeoutError(err) && elapsed >= 2500) {
+            markModelCooldown(slotModel, 60 * 1000);
+          }
+          lastError = err;
+          if (!settled && nextIdx < candidates.length && timeLeft() >= 500) {
+            launchNextSlot();
+          }
+        } finally {
+          inFlight -= 1;
+          maybeFinishWithFailure();
+        }
+      })();
+    };
+
+    launchNextSlot();
+  });
 
   if (metricsOut) metricsOut.geminiAttempts = attempts;
 
-  const response = lastResponse;
-  const data = lastData;
-
-  if (!response || !response.ok) {
-    const status = Number(response?.status || 500);
-    const apiMessage = String(data?.error?.message || "");
-    const apiStatus = String(data?.error?.status || "");
-    console.error("Gemini request failed with HTTP", status, apiStatus);
-    if (status === 401 || status === 403 || /API_KEY_INVALID|API key not valid/i.test(apiMessage)) {
-      throw new Error("GEMINI_KEY_REJECTED");
-    }
-    if (status === 400 && (apiStatus === "FAILED_PRECONDITION" || /location is not supported|free tier is not available/i.test(apiMessage))) {
-      throw new Error("GEMINI_REGION_RESTRICTED");
-    }
-    if (status === 404) throw new Error("INVALID_MODEL_NAME");
-    if (status === 429) throw new Error("GEMINI_QUOTA");
-    throw new Error("GEMINI_REQUEST_FAILED");
-  }
-
-  const candidate = data?.candidates?.[0];
-  const answer = (candidate?.content?.parts || [])
-    .filter(part => part && !part.thought && typeof part.text === "string")
-    .map(part => part.text)
-    .join("")
-    .trim();
-
-  if (!answer) {
-    if (data?.promptFeedback?.blockReason || candidate?.finishReason === "SAFETY") {
-      throw new Error("GEMINI_BLOCKED");
-    }
-    throw new Error("GEMINI_EMPTY_RESPONSE");
-  }
-  if (candidate?.finishReason === "MAX_TOKENS") {
+  const { answer, data } = winnerResult;
+  if (data?.candidates?.[0]?.finishReason === "MAX_TOKENS") {
     console.warn("Gemini reached the output token limit.");
   }
 
