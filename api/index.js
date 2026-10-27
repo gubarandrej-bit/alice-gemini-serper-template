@@ -36,9 +36,9 @@ import {
 } from "../lib/cache.js";
 import { checkRateLimit, clearRateLimitForTests, extractClientKey } from "../lib/rateLimit.js";
 
-const DEFAULT_MODEL = "gemini-3.1-flash-lite";
-const DEFAULT_FALLBACK_MODEL = "gemini-3.5-flash-lite";
-const TERTIARY_FALLBACK_MODEL = "gemini-3.6-flash";
+const DEFAULT_MODEL = "gemini-3.6-flash";
+const DEFAULT_FALLBACK_MODEL = "gemini-3.1-flash-lite";
+const TERTIARY_FALLBACK_MODEL = "gemini-3.5-flash-lite";
 
 // Yandex Dialogs expects the full HTTP round-trip within ~4.5s.
 const TOTAL_RESPONSE_BUDGET_MS = 4150;
@@ -430,7 +430,7 @@ function resolveHedgeDelayMs(hasSearchContext) {
     const parsed = Number(raw);
     if (Number.isFinite(parsed) && parsed >= 50) return parsed;
   }
-  return hasSearchContext ? 450 : 850;
+  return hasSearchContext ? 600 : 1100;
 }
 
 async function askGemini({
