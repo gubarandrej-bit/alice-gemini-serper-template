@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Яндекс Алиса + Gemini — Статус вебхука</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --surface: #171b26;
+      --surface-2: #1f2535;
+      --border: #2c344a;
+      --text: #eef1f8;
+      --muted: #98a2b8;
+      --accent: #7c5cff;
+      --accent-hover: #6946ff;
+      --ok: #22c55e;
+      --ok-bg: rgba(34, 197, 94, 0.12);
+      --warn: #f59e0b;
+      --warn-bg: rgba(245, 158, 11, 0.13);
+      --err: #ef4444;
+      --err-bg: rgba(239, 68, 68, 0.13);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+      background: radial-gradient(circle at 50% 0%, #1c1938 0%, var(--bg) 55%);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.5;
+      padding: 36px 18px 56px;
+    }
+
+    .container {
+      max-width: 780px;
+      margin: 0 auto;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 14px;
+      margin-bottom: 24px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .logo {
+      width: 46px;
+      height: 46px;
+      border-radius: 14px;
+      background: linear-gradient(135deg, #7c5cff, #4f46e5);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 8px 24px rgba(124, 92, 255, 0.35);
+      flex-shrink: 0;
+    }
+
+    h1 {
+      font-size: 1.45rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    .subtitle {
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 13px;
+      border-radius: 999px;
+      font-size: 0.84rem;
+      font-weight: 600;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+    }
+
+    .pill.ok {
+      color: var(--ok);
+      background: var(--ok-bg);
+      border-color: rgba(34, 197, 94, 0.3);
+    }
+
+    .pill.warn {
+      color: var(--warn);
+      background: var(--warn-bg);
+      border-color: rgba(245, 158, 11, 0.3);
+    }
+
+    .pill.err {
+      color: var(--err);
+      background: var(--err-bg);
+      border-color: rgba(239, 68, 68, 0.3);
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 20px 22px;
+      margin-bottom: 18px;
+    }
+
+    .card-title {
+      font-size: 0.86rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      font-weight: 600;
+      margin-bottom: 10px;
+    }
+
+    .url-box {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .url-code {
+      flex: 1;
+      min-width: 220px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 11px 14px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92rem;
+      color: #c4b5fd;
+      overflow-x: auto;
+      white-space: nowrap;
+    }
+
+    button {
+      cursor: pointer;
+      border: none;
+      border-radius: 10px;
+      padding: 11px 16px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: #fff;
+      background: var(--accent);
+      transition: background 0.15s ease, transform 0.1s ease;
+    }
+
+    button:hover {
+      background: var(--accent-hover);
+    }
+
+    button:active {
+      transform: translateY(1px);
+    }
+
+    button.secondary {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    button.secondary:hover {
+      background: #283044;
+    }
+
+    .hint {
+      margin-top: 9px;
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(225px, 1fr));
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px 18px;
+    }
+
+    .stat-label {
+      font-size: 0.82rem;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .stat-value {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+
+    .stat-sub {
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+
+    .commands-list {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+      gap: 10px;
+      margin-top: 8px;
+    }
+
+    .cmd-item {
+      background: var(--surface-2);
+      border-radius: 10px;
+      padding: 10px 13px;
+      font-size: 0.88rem;
+    }
+
+    .cmd-item strong {
+      color: #d8b4fe;
+      display: block;
+      margin-bottom: 2px;
+    }
+
+    .test-output {
+      margin-top: 12px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      font-size: 0.88rem;
+      display: none;
+    }
+
+    .test-output.visible {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+            <path d="M12 3L14.6 9.4L21 12L14.6 14.6L12 21L9.4 14.6L3 12L9.4 9.4L12 3Z" fill="white"/>
+          </svg>
+        </div>
+        <div>
+          <h1>Яндекс Алиса + Gemini</h1>
+          <div class="subtitle">Панель диагностики голосового вебхука на Vercel</div>
+        </div>
+      </div>
+      <div id="overall-badge" class="pill">
+        <span class="dot"></span>
+        <span id="overall-text">Проверка сервера…</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Webhook URL для Яндекс Диалогов</div>
+      <div class="url-box">
+        <div class="url-code" id="webhook-url">https://ваш-домен.vercel.app/api</div>
+        <button id="copy-btn" type="button">Скопировать адрес</button>
+        <button id="test-btn" class="secondary" type="button">Проверить отклик</button>
+      </div>
+      <div class="hint">
+        Вставьте этот адрес в настройках навыка: <strong>Яндекс Диалоги → Backend → Webhook URL</strong> и включите галочку <strong>«Использовать хранилище данных в навыке»</strong>.
+      </div>
+      <div id="test-result" class="test-output"></div>
+    </div>
+
+    <div class="grid">
+      <div class="stat-card">
+        <div class="stat-label">Нейросеть Gemini</div>
+        <div class="stat-value" id="st-gemini">—</div>
+        <div class="stat-sub" id="st-models">Проверка моделей…</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Поиск в интернете</div>
+        <div class="stat-value" id="st-search">—</div>
+        <div class="stat-sub" id="st-search-sub">Актуальные данные и погода</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Долгие ответы (4.5с+)</div>
+        <div class="stat-value" id="st-cache">—</div>
+        <div class="stat-sub" id="st-cache-sub">Фоновое додумывание по «дальше»</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Защита вебхука</div>
+        <div class="stat-value" id="st-security">—</div>
+        <div class="stat-sub" id="st-security-sub">Фильтрация чужих вызовов</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Голосовые команды внутри навыка</div>
+      <div class="commands-list">
+        <div class="cmd-item">
+          <strong>«Запомни мой город Новосибирск»</strong>
+          Сохраняет город между разговорами для погоды и событий (также: «меня зовут…», «отвечай кратко / подробно»).
+        </div>
+        <div class="cmd-item">
+          <strong>«Режим переводчика / сказочника / викторины»</strong>
+          Переключает роль помощника. Вернуться назад — «обычный режим».
+        </div>
+        <div class="cmd-item">
+          <strong>«Дальше» или «Подробнее»</strong>
+          Дочитывает длинный ответ по частям или забирает готовый сложный ответ.
+        </div>
+        <div class="cmd-item">
+          <strong>«Забудь» / «Хватит»</strong>
+          «Забудь» очищает историю текущей беседы, а «хватит» завершает работу навыка.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const origin = window.location.origin && window.location.origin !== "null"
+        ? window.location.origin
+        : "https://YOUR-PROJECT.vercel.app";
+      const apiUrl = origin + "/api";
+      document.getElementById("webhook-url").textContent = apiUrl;
+
+      document.getElementById("copy-btn").addEventListener("click", async function () {
+        const btn = this;
+        try {
+          await navigator.clipboard.writeText(apiUrl);
+          btn.textContent = "Скопировано!";
+          setTimeout(() => { btn.textContent = "Скопировать адрес"; }, 1800);
+        } catch {
+          btn.textContent = "Выделите адрес вручную";
+        }
+      });
+
+      const badge = document.getElementById("overall-badge");
+      const badgeText = document.getElementById("overall-text");
+
+      async function loadDiagnostics() {
+        try {
+          const res = await fetch("/api", { method: "GET" });
+          const data = await res.json();
+          const st = data.status || {};
+
+          if (data.ok && st.geminiConfigured) {
+            badge.className = "pill ok";
+            badgeText.textContent = "Готов к работе";
+          } else if (data.ok) {
+            badge.className = "pill warn";
+            badgeText.textContent = "Нужен GEMINI_API_KEY";
+          } else {
+            badge.className = "pill err";
+            badgeText.textContent = "Ошибка вебхука";
+          }
+
+          document.getElementById("st-gemini").textContent = st.geminiConfigured
+            ? "✅ Ключ подключён"
+            : "⚠️ Ключ не задан";
+          document.getElementById("st-models").textContent =
+            "Основная: " + (st.primaryModel || "—") +
+            (st.fallbackModel ? " · Резерв: " + st.fallbackModel : "");
+
+          const searchMap = {
+            serper: ["✅ Serper Search", "Быстрый поиск Google + кэш 7 мин"],
+            gemini_grounding: ["✅ Поиск Gemini", "Встроенный Google Search без ключа Serper"],
+            disabled: ["⚪ Отключён", "Только знания модели"]
+          };
+          const [sTitle, sSub] = searchMap[st.searchMode] || ["—", ""];
+          document.getElementById("st-search").textContent = sTitle;
+          document.getElementById("st-search-sub").textContent = sSub;
+
+          if (st.asyncCacheMode === "upstash_redis") {
+            document.getElementById("st-cache").textContent = "✅ Upstash Redis";
+            document.getElementById("st-cache-sub").textContent = "Межсерверный кэш + waitUntil";
+          } else {
+            document.getElementById("st-cache").textContent = "✅ В памяти (waitUntil)";
+            document.getElementById("st-cache-sub").textContent = "Додумывание ответов до 9 сек";
+          }
+
+          if (st.skillIdProtected || st.webhookSecretProtected) {
+            document.getElementById("st-security").textContent = "🔒 Защищён";
+            document.getElementById("st-security-sub").textContent = "Проверка Skill ID / Secret активна";
+          } else {
+            document.getElementById("st-security").textContent = "🔓 Открытый режим";
+            document.getElementById("st-security-sub").textContent = "Можно задать ALICE_SKILL_ID в Vercel";
+          }
+        } catch {
+          badge.className = "pill warn";
+          badgeText.textContent = "Локальный просмотр";
+          document.getElementById("st-gemini").textContent = "Откройте на домене Vercel";
+        }
+      }
+
+      document.getElementById("test-btn").addEventListener("click", async function () {
+        const out = document.getElementById("test-result");
+        out.className = "test-output visible";
+        out.textContent = "Отправка тестового запуска в /api…";
+        try {
+          const res = await fetch("/api", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              version: "1.0",
+              meta: { interfaces: { screen: {} } },
+              session: { new: true },
+              request: { command: "", original_utterance: "", type: "SimpleUtterance" }
+            })
+          });
+          if (res.status === 403) {
+            out.textContent = "🔒 Вебхук работает и защищён (403 Forbidden для внешних запросов без вашего Skill ID / Secret). Проверяйте навык напрямую через Яндекс Диалоги или колонку!";
+            return;
+          }
+          const json = await res.json();
+          out.textContent = "Ответ навыка: «" + (json?.response?.text || JSON.stringify(json)) + "»";
+        } catch (err) {
+          out.textContent = "Не удалось выполнить запрос: " + err.message;
+        }
+      });
+
+      loadDiagnostics();
+    })();
+  </script>
+</body>
+</html>

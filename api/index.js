@@ -1,31 +1,53 @@
 import { timingSafeEqual } from "node:crypto";
+import {
+  MAX_ALICE_TEXT,
+  fitAliceText,
+  normalizeCommand,
+  splitAliceAnswer,
+  stripVoiceUnfriendlyFormatting,
+  truncateSafe
+} from "../lib/text.js";
+import { buildAliceTts } from "../lib/tts.js";
+import { buildSystemPrompt, detectModeCommand } from "../lib/modes.js";
+import {
+  MAX_HISTORY_MESSAGE_CHARS,
+  detectProfileCommand,
+  fitApplicationState,
+  fitHistoryToStateLimit,
+  fitSessionState,
+  safeApplicationState,
+  safeHistory,
+  safeMode,
+  safeUserProfile
+} from "../lib/state.js";
+import { buildScreenButtons } from "../lib/buttons.js";
+import {
+  clearCachesForTests,
+  consumePendingResult,
+  generatePendingId,
+  getCachedSearchResult,
+  isUpstashConfigured,
+  registerBackgroundPendingTask,
+  setCachedSearchResult
+} from "../lib/cache.js";
 
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
-const MAX_HISTORY_MESSAGES = 8;
-const MAX_HISTORY_MESSAGE_CHARS = 180;
-const MAX_SESSION_STATE_BYTES = 960; // Yandex Alice hard limit for session_state JSON is 1024 bytes
-const MAX_ALICE_TEXT = 1024;
+const DEFAULT_FALLBACK_MODEL = "gemini-3.1-flash-lite";
 
 // Yandex Dialogs expects the full HTTP round-trip within ~4.5s.
-// Keep ~600ms margin for network transit between Yandex and Vercel.
-const TOTAL_RESPONSE_BUDGET_MS = 3900;
+const TOTAL_RESPONSE_BUDGET_MS = 3850;
 const SERPER_TIMEOUT_MS = 700;
 const MIN_GEMINI_BUDGET_AFTER_SEARCH_MS = 2500;
 const GEMINI_TIMEOUT_MS = 3600;
-const GEMINI_MAX_OUTPUT_TOKENS = 500;
-
-const BASE_SYSTEM_PROMPT = [
-  "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
-  "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно воспринимать на слух.",
-  "Обычно используй 1–3 коротких предложения.",
-  "Не используй Markdown, звёздочки, таблицы, списки с символами, ссылки или длинные вступления.",
-  "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них и не выдумывай отсутствующие факты.",
-  "Если точных данных нет, честно скажи об этом."
-].join(" ");
+const BACKGROUND_GEMINI_TIMEOUT_MS = 8800; // Fits safely inside Vercel maxDuration: 10s
+const GEMINI_MAX_OUTPUT_TOKENS = 650;
 
 const EXIT_COMMAND_RE = /^(хватит|стоп|выйти|выход|закончить|закройся|завершить|пока|до свидания|все спасибо|всё спасибо)$/i;
 const HELP_COMMAND_RE = /^(помощь|справка|что ты умеешь|что ты можешь|кто ты|инструкция|как пользоваться)$/i;
 const RESET_COMMAND_RE = /^(забудь|забудь все|забудь всё|сбрось контекст|сбросить контекст|очисти историю|новый диалог|начни сначала|смени тему)$/i;
+const CONTINUE_COMMAND_RE = /^(дальше|продолжай|продолжи|еще|ещё|читай дальше|расскажи дальше|готово|ну что)$/i;
+const AFFIRMATIVE_CONTINUE_RE = /^(да|давай|ага|угу|хочу)$/i;
+const ELABORATE_COMMAND_RE = /^(подробнее|расскажи подробнее|объясни подробнее)$/i;
 
 const SEARCH_INTENT_RE = new RegExp(
   [
@@ -42,150 +64,70 @@ const SEARCH_INTENT_RE = new RegExp(
   "i"
 );
 
+const LOCAL_CITY_INTENT_RE = /погод|температур|прогноз|дождь|снег|ветер|градус|пробк|афиш|куда сходить|расписани/i;
+const EXPLICIT_LOCATION_RE = /\b(в|во|на|из|для|по|около|у)\s+[а-яёa-z]{3,}/i;
 const FOLLOWUP_QUERY_RE = /^(а |и |ну а |а в |а во |а на |а про |а по |а там|а у |а сколько|а когда|а завтра|а вчера|а сегодня|what about|how about|and in )/i;
 
-function truncateSafe(value, maxChars) {
-  const str = String(value ?? "");
-  if (str.length <= maxChars) return str;
-  let end = maxChars;
-  // Avoid splitting a UTF-16 surrogate pair in half
-  const code = str.charCodeAt(end - 1);
-  if (code >= 0xd800 && code <= 0xdbff) {
-    end -= 1;
-  }
-  return str.slice(0, Math.max(0, end));
-}
+function aliceResponse(text, endSession = false, history = [], extra = {}) {
+  const fittedText = fitAliceText(text);
+  const mode = endSession ? "assistant" : safeMode(extra.mode);
+  const sessionState = endSession ? { history: [] } : fitSessionState(history, mode);
 
-function stripVoiceUnfriendlyFormatting(value) {
-  return String(value ?? "")
-    .replace(/```[\s\S]*?```/g, " ")
-    .replace(/`([^`]+)`/g, "$1")
-    .replace(/\[([^\]]+)\]\((?:https?:\/\/[^\s)]+)\)/g, "$1")
-    .replace(/https?:\/\/[^\s)]+?([.,!?;:]?)(?=\s|$)/gi, "$1")
-    .replace(/(^|\n)\s*#{1,6}\s+/g, "$1")
-    .replace(/(^|\n)\s*[-*•]\s+/g, "$1")
-    .replace(/\*\*([^*]+)\*\*/g, "$1")
-    .replace(/__([^_]+)__/g, "$1")
-    .replace(/(^|\s)\*([^*\n]+)\*(?=\s|[.,!?;:]|$)/g, "$1$2")
-    .replace(/[\r\n\t]+/g, " ")
-    .replace(/\s+([.,!?;:])/g, "$1")
-    .replace(/\s{2,}/g, " ")
-    .trim();
-}
-
-function fitAliceText(value) {
-  const text = stripVoiceUnfriendlyFormatting(value);
-
-  if (!text) return "Не удалось подготовить ответ.";
-  if (text.length <= MAX_ALICE_TEXT) return text;
-
-  const candidate = truncateSafe(text, MAX_ALICE_TEXT - 1);
-  let sentenceEnd = -1;
-  for (let i = candidate.length - 1; i >= 0; i--) {
-    const ch = candidate[i];
-    if ((ch === "." || ch === "!" || ch === "?" || ch === "…") && (i === candidate.length - 1 || candidate[i + 1] === " ")) {
-      sentenceEnd = i;
-      break;
-    }
-  }
-  if (sentenceEnd >= 300) {
-    return candidate.slice(0, sentenceEnd + 1).trim();
-  }
-
-  const lastSpace = candidate.lastIndexOf(" ");
-  return (lastSpace > 200 ? candidate.slice(0, lastSpace) : candidate).trim() + "…";
-}
-
-function safeHistory(history) {
-  if (!Array.isArray(history)) return [];
-  const valid = [];
-  for (const item of history) {
-    if (!item || (item.role !== "user" && item.role !== "model") || typeof item.text !== "string") {
-      continue;
-    }
-    const cleaned = item.text.trim();
-    if (!cleaned) continue;
-    const truncated = truncateSafe(cleaned, MAX_HISTORY_MESSAGE_CHARS);
-
-    // Keep strict user/model alternation expected by Gemini multi-turn contents
-    if (valid.length > 0 && valid[valid.length - 1].role === item.role) {
-      valid[valid.length - 1] = { role: item.role, text: truncated };
-    } else {
-      valid.push({ role: item.role, text: truncated });
-    }
-  }
-
-  let sliced = valid.slice(-MAX_HISTORY_MESSAGES);
-  // Gemini requires conversation history to start with a "user" turn
-  while (sliced.length > 0 && sliced[0].role !== "user") {
-    sliced.shift();
-  }
-  return sliced;
-}
-
-function fitHistoryToStateLimit(history) {
-  const normalized = safeHistory(history);
-  while (normalized.length > 0) {
-    const bytes = Buffer.byteLength(JSON.stringify({ history: normalized }), "utf8");
-    if (bytes <= MAX_SESSION_STATE_BYTES) break;
-    normalized.shift();
-    while (normalized.length > 0 && normalized[0].role !== "user") {
-      normalized.shift();
-    }
-  }
-  return normalized;
-}
-
-function aliceResponse(text, endSession = false, history = []) {
-  return {
-    version: "1.0",
-    response: {
-      text: fitAliceText(text),
-      end_session: Boolean(endSession)
-    },
-    session_state: {
-      history: endSession ? [] : fitHistoryToStateLimit(history)
-    }
+  const responsePayload = {
+    text: fittedText,
+    tts: typeof extra.tts === "string" && extra.tts ? extra.tts : buildAliceTts(fittedText),
+    end_session: Boolean(endSession)
   };
+
+  if (Array.isArray(extra.buttons) && extra.buttons.length > 0 && !endSession) {
+    responsePayload.buttons = extra.buttons;
+  }
+
+  const envelope = {
+    version: "1.0",
+    response: responsePayload,
+    session_state: sessionState
+  };
+
+  if (extra.userStateUpdate && typeof extra.userStateUpdate === "object") {
+    envelope.user_state_update = extra.userStateUpdate;
+  }
+
+  if (extra.applicationState !== undefined) {
+    envelope.application_state = fitApplicationState(extra.applicationState);
+  }
+
+  return envelope;
 }
 
-function isSearchIntent(text) {
-  return SEARCH_INTENT_RE.test(String(text ?? ""));
+function isSearchIntent(text, mode = "assistant") {
+  const str = String(text ?? "");
+  if (mode !== "assistant") {
+    return /найди в интернете|поищи в интернете|погугли/i.test(str);
+  }
+  return SEARCH_INTENT_RE.test(str);
 }
 
-function buildSearchQuery(text, history = []) {
-  const current = String(text ?? "").trim();
+function buildSearchQuery(text, history = [], userProfile = {}) {
+  let current = String(text ?? "").trim();
   if (!current) return "";
 
   const safe = safeHistory(history);
   const lastUserTurn = [...safe].reverse().find(item => item.role === "user");
   if (lastUserTurn && (current.length < 40 || FOLLOWUP_QUERY_RE.test(current))) {
-    return truncateSafe(`${lastUserTurn.text} ${current}`, 200);
+    current = `${lastUserTurn.text} ${current}`;
   }
-  return truncateSafe(current, 200);
-}
 
-function buildSystemPrompt(timezone) {
-  const tz = typeof timezone === "string" && timezone.trim() ? timezone.trim() : "Europe/Moscow";
-  let dateLabel = "";
-  try {
-    dateLabel = new Intl.DateTimeFormat("ru-RU", {
-      timeZone: tz,
-      weekday: "long",
-      year: "numeric",
-      month: "long",
-      day: "numeric"
-    }).format(new Date());
-  } catch {
-    dateLabel = new Intl.DateTimeFormat("ru-RU", {
-      timeZone: "Europe/Moscow",
-      weekday: "long",
-      year: "numeric",
-      month: "long",
-      day: "numeric"
-    }).format(new Date());
+  if (
+    userProfile?.city &&
+    LOCAL_CITY_INTENT_RE.test(current) &&
+    !EXPLICIT_LOCATION_RE.test(current) &&
+    !current.toLowerCase().includes(userProfile.city.toLowerCase())
+  ) {
+    current = `${current} ${userProfile.city}`;
   }
-  return `${BASE_SYSTEM_PROMPT} Сегодняшняя дата: ${dateLabel}.`;
+
+  return truncateSafe(current, 200);
 }
 
 function isTimeoutError(error) {
@@ -231,7 +173,14 @@ async function fetchJson(url, options, timeoutMs) {
 
 async function searchWeb(query, timeoutMs) {
   const key = process.env.SERPER_API_KEY?.trim();
-  if (!key || timeoutMs < 150) return "";
+  if (!key) return "";
+
+  const cached = getCachedSearchResult(query);
+  if (cached !== null) {
+    return cached;
+  }
+
+  if (timeoutMs < 150) return "";
 
   try {
     const { response, data } = await fetchJson(
@@ -274,7 +223,11 @@ async function searchWeb(query, timeoutMs) {
       if (title || snippet) items.push(line);
     }
 
-    return items.length ? items.join("\n") : "";
+    const formatted = items.length ? items.join("\n") : "";
+    if (formatted) {
+      setCachedSearchResult(query, formatted);
+    }
+    return formatted;
   } catch (error) {
     if (isTimeoutError(error)) {
       console.warn("Serper request timed out; continuing without search.");
@@ -285,13 +238,66 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
-async function askGemini(text, history, searchContext, timeoutMs, timezone) {
+function resolveFallbackModel(primaryModel) {
+  const configured = process.env.GEMINI_FALLBACK_MODEL?.trim();
+  if (configured === "none" || configured === "false") return "";
+  if (configured && /^[A-Za-z0-9._-]+$/.test(configured) && configured !== primaryModel) {
+    return configured;
+  }
+  return primaryModel === DEFAULT_FALLBACK_MODEL ? "gemini-3.6-flash" : DEFAULT_FALLBACK_MODEL;
+}
+
+async function callSingleGeminiModel({
+  model,
+  key,
+  systemText,
+  contents,
+  useGoogleGrounding,
+  timeoutMs
+}) {
+  const requestBody = {
+    systemInstruction: { parts: [{ text: systemText }] },
+    contents,
+    generationConfig: {
+      temperature: 0.5,
+      maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS
+    }
+  };
+
+  if (useGoogleGrounding) {
+    requestBody.tools = [{ google_search: {} }];
+  }
+
+  return fetchJson(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": key
+      },
+      body: JSON.stringify(requestBody)
+    },
+    timeoutMs
+  );
+}
+
+async function askGemini({
+  text,
+  history,
+  searchContext,
+  timeoutMs,
+  timezone,
+  mode = "assistant",
+  userProfile = {},
+  useGoogleGrounding = false
+}) {
   const key = process.env.GEMINI_API_KEY?.trim();
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
-  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
-  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
+  const primaryModel = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
+  if (!/^[A-Za-z0-9._-]+$/.test(primaryModel)) throw new Error("INVALID_MODEL_NAME");
 
   const contents = safeHistory(history).map(item => ({
     role: item.role,
@@ -308,25 +314,50 @@ async function askGemini(text, history, searchContext, timeoutMs, timezone) {
     contents.push({ role: "user", parts: [{ text: prompt }] });
   }
 
-  const { response, data } = await fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": key
-      },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: buildSystemPrompt(timezone) }] },
+  const systemText = buildSystemPrompt({ timezone, mode, userProfile });
+  const startedAt = Date.now();
+  const timeLeft = () => timeoutMs - (Date.now() - startedAt);
+
+  let { response, data } = await callSingleGeminiModel({
+    model: primaryModel,
+    key,
+    systemText,
+    contents,
+    useGoogleGrounding,
+    timeoutMs: timeLeft()
+  });
+
+  // If grounding tool caused a 400 validation error on this key/model, retry cleanly without tools
+  if (!response.ok && useGoogleGrounding && response.status === 400 && timeLeft() >= 700) {
+    const apiMsg = String(data?.error?.message || "");
+    if (!/API_KEY_INVALID|API key not valid|location is not supported|free tier is not available/i.test(apiMsg)) {
+      console.warn("Retrying Gemini without google_search grounding tool after HTTP 400");
+      ({ response, data } = await callSingleGeminiModel({
+        model: primaryModel,
+        key,
+        systemText,
         contents,
-        generationConfig: {
-          temperature: 0.5,
-          maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS
-        }
-      })
-    },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
-  );
+        useGoogleGrounding: false,
+        timeoutMs: timeLeft()
+      }));
+    }
+  }
+
+  // Auto-fallback to secondary model on quota (429), model missing (404), or transient 5xx overload
+  if (!response.ok && (response.status === 429 || response.status === 404 || response.status >= 500) && timeLeft() >= 700) {
+    const fallbackModel = resolveFallbackModel(primaryModel);
+    if (fallbackModel) {
+      console.warn(`Primary model ${primaryModel} returned HTTP ${response.status}; falling back to ${fallbackModel}`);
+      ({ response, data } = await callSingleGeminiModel({
+        model: fallbackModel,
+        key,
+        systemText,
+        contents,
+        useGoogleGrounding,
+        timeoutMs: timeLeft()
+      }));
+    }
+  }
 
   if (!response.ok) {
     const status = Number(response.status);
@@ -442,21 +473,30 @@ function parseRequestBody(rawBody) {
   return {};
 }
 
-function normalizeCommand(value) {
-  return String(value ?? "")
-    .toLowerCase()
-    .replace(/[.,!?…«»"'()[\]{}]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+function buildDiagnosticsPayload() {
+  const primaryModel = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
+  const hasSerper = Boolean(process.env.SERPER_API_KEY?.trim());
+  const groundingEnabled = process.env.GEMINI_GROUNDING !== "false";
+
+  return {
+    ok: true,
+    service: "alice-gemini-serper",
+    message: "Webhook is ready. Yandex Dialogs should send POST requests to /api.",
+    status: {
+      geminiConfigured: Boolean(process.env.GEMINI_API_KEY?.trim()),
+      primaryModel,
+      fallbackModel: resolveFallbackModel(primaryModel) || null,
+      searchMode: hasSerper ? "serper" : (groundingEnabled ? "gemini_grounding" : "disabled"),
+      asyncCacheMode: isUpstashConfigured() ? "upstash_redis" : "memory",
+      skillIdProtected: Boolean(process.env.ALICE_SKILL_ID?.trim()),
+      webhookSecretProtected: Boolean(process.env.WEBHOOK_SECRET?.trim())
+    }
+  };
 }
 
 export default async function handler(req, res) {
   if (req.method === "GET") {
-    return res.status(200).json({
-      ok: true,
-      service: "alice-gemini-serper",
-      message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
-    });
+    return res.status(200).json(buildDiagnosticsPayload());
   }
 
   if (req.method !== "POST") {
@@ -476,91 +516,331 @@ export default async function handler(req, res) {
   const rawCommand = hasCommandField ? body.request.command.trim() : "";
   const rawUtterance = typeof body?.request?.original_utterance === "string" ? body.request.original_utterance.trim() : "";
   const isNewSession = body?.session?.new === true;
-  const oldHistory = fitHistoryToStateLimit(body?.state?.session?.history);
+  const hasScreen = Boolean(body?.meta?.interfaces?.screen);
 
-  // Yandex Dialogs health-check ping: never bill Gemini/Serper for technical probes
+  const oldHistory = fitHistoryToStateLimit(body?.state?.session?.history);
+  const currentMode = safeMode(body?.state?.session?.mode);
+  const userProfile = safeUserProfile(body?.state?.user);
+  const oldAppState = safeApplicationState(body?.state?.application);
+  const hadAppState = Boolean(oldAppState.more || oldAppState.pendingId || oldAppState.pendingQ);
+
+  // 1. Technical health-check ping from Yandex Dialogs
   if (rawUtterance.toLowerCase() === "ping" || rawCommand.toLowerCase() === "ping") {
     return res.status(200).json(aliceResponse("pong", true, []));
   }
 
-  // On session launch ("Алиса, запусти навык X"), Yandex sends session.new=true, command="",
-  // while original_utterance still contains the activation phrase. Use command on new sessions
-  // so launch greets instantly (and warms up Vercel) instead of sending the activation phrase to Gemini.
-  const text = isNewSession && hasCommandField
-    ? rawCommand
-    : (rawUtterance || rawCommand);
+  const text = isNewSession && hasCommandField ? rawCommand : (rawUtterance || rawCommand);
 
+  // 2. Bare launch greeting
   if (!text) {
-    return res.status(200).json(aliceResponse(
-      "Привет! Я могу ответить на вопрос или найти актуальную информацию в интернете. Что хочешь узнать?",
-      false,
-      oldHistory
-    ));
+    const greetingName = userProfile.name ? `, ${userProfile.name}` : "";
+    const greeting = `Привет${greetingName}! Я могу ответить на вопрос, найти актуальную информацию в интернете или включить режим переводчика, сказочника и викторины. О чём поговорим?`;
+    return res.status(200).json(
+      aliceResponse(greeting, false, oldHistory, {
+        mode: currentMode,
+        buttons: buildScreenButtons({ hasScreen, mode: currentMode, isLaunch: true, userProfile }),
+        applicationState: hadAppState ? {} : undefined
+      })
+    );
   }
 
   const cleanCmd = normalizeCommand(text);
 
+  // 3. Session exit commands
   if (EXIT_COMMAND_RE.test(cleanCmd)) {
-    return res.status(200).json(aliceResponse("До встречи! Обращайся ещё.", true, []));
+    return res.status(200).json(
+      aliceResponse("До встречи! Обращайся ещё.", true, [], {
+        applicationState: hadAppState ? {} : undefined
+      })
+    );
   }
 
+  // 4. Help / moderation support
   if (HELP_COMMAND_RE.test(cleanCmd)) {
-    return res.status(200).json(aliceResponse(
-      "Я отвечаю на вопросы с помощью нейросети Gemini и ищу свежие новости, погоду или курсы в интернете. Просто задай вопрос. Скажи «забудь», чтобы начать заново, или «хватит», чтобы выйти.",
-      false,
-      oldHistory
-    ));
+    const helpText =
+      "Я отвечаю на вопросы с помощью нейросети Gemini и ищу свежие новости, погоду или курсы в интернете. " +
+      "Доступные команды: «запомни мой город Москва», «режимы» (переводчик, сказочник, викторина), «дальше» для продолжения длинного ответа, «забудь» для смены темы и «хватит» для выхода.";
+    return res.status(200).json(
+      aliceResponse(helpText, false, oldHistory, {
+        mode: currentMode,
+        buttons: buildScreenButtons({
+          hasScreen,
+          mode: currentMode,
+          hasMore: Boolean(oldAppState.more),
+          hasPending: Boolean(oldAppState.pendingId),
+          userProfile
+        })
+      })
+    );
   }
 
+  // 5. Reset conversation history
   if (RESET_COMMAND_RE.test(cleanCmd)) {
-    return res.status(200).json(aliceResponse(
-      "Хорошо, начнём с чистого листа. О чём поговорим?",
-      false,
-      []
-    ));
+    return res.status(200).json(
+      aliceResponse("Хорошо, начнём с чистого листа. О чём поговорим?", false, [], {
+        mode: "assistant",
+        buttons: buildScreenButtons({ hasScreen, mode: "assistant", isLaunch: true, userProfile }),
+        applicationState: hadAppState ? {} : undefined
+      })
+    );
   }
 
+  // 6. Voice mode switching (translator, storyteller, quiz, assistant)
+  const modeAction = detectModeCommand(text);
+  if (modeAction) {
+    const nextMode = modeAction.type === "switch" ? modeAction.mode : currentMode;
+    const nextHistory = modeAction.type === "switch" ? [] : oldHistory;
+    return res.status(200).json(
+      aliceResponse(modeAction.reply, false, nextHistory, {
+        mode: nextMode,
+        buttons: buildScreenButtons({ hasScreen, mode: nextMode, userProfile }),
+        applicationState: hadAppState ? {} : undefined
+      })
+    );
+  }
+
+  // 7. Persistent user profile preferences (city, name, verbosity style)
+  const profileAction = detectProfileCommand(text, userProfile, currentMode);
+  if (profileAction) {
+    const updatedProfile = profileAction.userStateUpdate
+      ? safeUserProfile(profileAction.userStateUpdate)
+      : userProfile;
+    return res.status(200).json(
+      aliceResponse(profileAction.reply, false, oldHistory, {
+        mode: currentMode,
+        userStateUpdate: profileAction.userStateUpdate,
+        buttons: buildScreenButtons({ hasScreen, mode: currentMode, userProfile: updatedProfile })
+      })
+    );
+  }
+
+  // 8. Continue reading ("дальше") — either async pending answer or paginated long text
+  const isContinueRequest =
+    CONTINUE_COMMAND_RE.test(cleanCmd) ||
+    ((oldAppState.pendingId || oldAppState.more) && AFFIRMATIVE_CONTINUE_RE.test(cleanCmd));
+
+  let effectiveText = text;
+
+  if (isContinueRequest) {
+    // 8a. Async pending background generation
+    if (oldAppState.pendingId) {
+      const pendingOutcome = await consumePendingResult(
+        oldAppState.pendingId,
+        Math.max(250, remainingMs() - 450)
+      );
+
+      if (pendingOutcome.status === "still_running") {
+        return res.status(200).json(
+          aliceResponse(
+            "Почти готово, додумываю последние детали. Скажите «дальше» ещё через пару секунд.",
+            false,
+            oldHistory,
+            {
+              mode: currentMode,
+              buttons: buildScreenButtons({ hasScreen, mode: currentMode, hasPending: true, userProfile }),
+              applicationState: oldAppState
+            }
+          )
+        );
+      }
+
+      if (pendingOutcome.status === "ready") {
+        const { question, answer, errorMessage } = pendingOutcome.record;
+        if (errorMessage || !answer) {
+          return res.status(200).json(
+            aliceResponse(errorForUser(new Error(errorMessage || "GEMINI_REQUEST_FAILED")), false, oldHistory, {
+              mode: currentMode,
+              buttons: buildScreenButtons({ hasScreen, mode: currentMode, userProfile }),
+              applicationState: {}
+            })
+          );
+        }
+
+        const split = splitAliceAnswer(answer);
+        const origQuestion = question || oldAppState.pendingQ || text;
+        const updatedHistory = fitHistoryToStateLimit(
+          [
+            ...oldHistory,
+            { role: "user", text: truncateSafe(origQuestion, MAX_HISTORY_MESSAGE_CHARS) },
+            { role: "model", text: truncateSafe(stripVoiceUnfriendlyFormatting(answer), MAX_HISTORY_MESSAGE_CHARS) }
+          ],
+          currentMode
+        );
+        const nextAppState = split.remainder ? { more: split.remainder } : {};
+        return res.status(200).json(
+          aliceResponse(split.text, false, updatedHistory, {
+            mode: currentMode,
+            buttons: buildScreenButtons({
+              hasScreen,
+              mode: currentMode,
+              hasMore: Boolean(split.remainder),
+              userProfile
+            }),
+            applicationState: nextAppState
+          })
+        );
+      }
+
+      // If pending cache missed (e.g. cold restart without Redis), seamlessly re-run saved question
+      if (oldAppState.pendingQ) {
+        effectiveText = oldAppState.pendingQ;
+      }
+    } else if (oldAppState.more) {
+      // 8b. Paginated remainder of a long answer
+      const split = splitAliceAnswer(oldAppState.more);
+      const nextAppState = split.remainder ? { more: split.remainder } : {};
+      return res.status(200).json(
+        aliceResponse(split.text, false, oldHistory, {
+          mode: currentMode,
+          buttons: buildScreenButtons({
+            hasScreen,
+            mode: currentMode,
+            hasMore: Boolean(split.remainder),
+            userProfile
+          }),
+          applicationState: nextAppState
+        })
+      );
+    } else if (oldHistory.length > 0) {
+      effectiveText = "Продолжи предыдущую мысль и расскажи об этом чуть подробнее.";
+    }
+  } else if (ELABORATE_COMMAND_RE.test(cleanCmd) && oldHistory.length > 0) {
+    effectiveText = "Расскажи об этом подробнее, с интересными деталями.";
+  }
+
+  // 9. Main search + Gemini pipeline (with soft deadline + background waitUntil support)
   try {
     let searchContext = "";
-    if (isSearchIntent(text) && process.env.SERPER_API_KEY?.trim()) {
+    const needsFreshness = isSearchIntent(effectiveText, currentMode);
+    const hasSerperKey = Boolean(process.env.SERPER_API_KEY?.trim());
+
+    if (needsFreshness && hasSerperKey) {
       const searchBudgetMs = Math.min(
         SERPER_TIMEOUT_MS,
         Math.max(0, remainingMs() - MIN_GEMINI_BUDGET_AFTER_SEARCH_MS)
       );
-      if (searchBudgetMs >= 150) {
-        const searchQuery = buildSearchQuery(text, oldHistory);
-        searchContext = await searchWeb(searchQuery, searchBudgetMs);
-      }
+      const searchQuery = buildSearchQuery(effectiveText, oldHistory, userProfile);
+      searchContext = await searchWeb(searchQuery, searchBudgetMs);
     }
 
-    const answer = await askGemini(
-      text,
-      oldHistory,
+    const useGoogleGrounding =
+      needsFreshness && !hasSerperKey && process.env.GEMINI_GROUNDING !== "false";
+
+    const asyncPendingEnabled = process.env.ASYNC_PENDING !== "false";
+    const configuredSoftDeadline = Number(process.env.SOFT_DEADLINE_MS) || 0;
+    const softDeadlineMs = configuredSoftDeadline > 0
+      ? configuredSoftDeadline
+      : Math.max(250, Math.min(GEMINI_TIMEOUT_MS, remainingMs()));
+
+    const fullGeminiTimeoutMs = asyncPendingEnabled
+      ? Math.max(softDeadlineMs, BACKGROUND_GEMINI_TIMEOUT_MS)
+      : softDeadlineMs;
+
+    const geminiPromise = askGemini({
+      text: effectiveText,
+      history: oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs())),
-      body?.meta?.timezone
+      timeoutMs: fullGeminiTimeoutMs,
+      timezone: body?.meta?.timezone,
+      mode: currentMode,
+      userProfile,
+      useGoogleGrounding
+    });
+
+    let raceWinner;
+    let softTimer;
+    if (asyncPendingEnabled) {
+      const softTimeoutPromise = new Promise(resolve => {
+        softTimer = setTimeout(() => resolve({ timedOutSoft: true }), softDeadlineMs);
+      });
+      try {
+        raceWinner = await Promise.race([
+          geminiPromise.then(answer => ({ timedOutSoft: false, answer })),
+          softTimeoutPromise
+        ]);
+      } finally {
+        clearTimeout(softTimer);
+      }
+    } else {
+      const answer = await geminiPromise;
+      raceWinner = { timedOutSoft: false, answer };
+    }
+
+    if (raceWinner.timedOutSoft) {
+      const pendingId = generatePendingId();
+      registerBackgroundPendingTask(pendingId, effectiveText, geminiPromise);
+
+      return res.status(200).json(
+        aliceResponse(
+          "Вопрос непростой, мне нужно ещё пару секунд. Скажите «дальше», чтобы услышать готовый ответ.",
+          false,
+          oldHistory,
+          {
+            mode: currentMode,
+            buttons: buildScreenButtons({ hasScreen, mode: currentMode, hasPending: true, userProfile }),
+            applicationState: {
+              pendingId,
+              pendingQ: truncateSafe(effectiveText, 120)
+            }
+          }
+        )
+      );
+    }
+
+    const answer = raceWinner.answer;
+    const split = splitAliceAnswer(answer);
+    const history = fitHistoryToStateLimit(
+      [
+        ...oldHistory,
+        { role: "user", text: truncateSafe(effectiveText, MAX_HISTORY_MESSAGE_CHARS) },
+        { role: "model", text: truncateSafe(stripVoiceUnfriendlyFormatting(answer), MAX_HISTORY_MESSAGE_CHARS) }
+      ],
+      currentMode
     );
 
-    const history = fitHistoryToStateLimit([
-      ...oldHistory,
-      { role: "user", text: truncateSafe(text, MAX_HISTORY_MESSAGE_CHARS) },
-      { role: "model", text: truncateSafe(stripVoiceUnfriendlyFormatting(answer), MAX_HISTORY_MESSAGE_CHARS) }
-    ]);
+    const nextAppState = split.remainder
+      ? { more: split.remainder }
+      : (hadAppState ? {} : undefined);
 
-    return res.status(200).json(aliceResponse(answer, false, history));
+    return res.status(200).json(
+      aliceResponse(split.text, false, history, {
+        mode: currentMode,
+        buttons: buildScreenButtons({
+          hasScreen,
+          mode: currentMode,
+          hasMore: Boolean(split.remainder),
+          userProfile
+        }),
+        applicationState: nextAppState
+      })
+    );
   } catch (error) {
     const normalizedError = isTimeoutError(error) ? new Error("TIME_BUDGET_EXHAUSTED") : error;
     console.warn("Alice webhook returned a fallback response:", normalizedError?.message || "unknown error");
-    return res.status(200).json(aliceResponse(errorForUser(normalizedError), false, oldHistory));
+    return res.status(200).json(
+      aliceResponse(errorForUser(normalizedError), false, oldHistory, {
+        mode: currentMode,
+        buttons: buildScreenButtons({ hasScreen, mode: currentMode, userProfile }),
+        applicationState: hadAppState ? {} : undefined
+      })
+    );
   }
 }
 
 export {
+  MAX_ALICE_TEXT,
   aliceResponse,
+  buildAliceTts,
+  buildScreenButtons,
   buildSearchQuery,
+  clearCachesForTests,
+  detectModeCommand,
+  detectProfileCommand,
   fitAliceText,
   fitHistoryToStateLimit,
+  fitSessionState,
   isSearchIntent,
   isTimeoutError,
-  safeHistory
+  safeHistory,
+  splitAliceAnswer
 };
