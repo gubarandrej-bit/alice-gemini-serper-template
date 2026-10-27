@@ -7,8 +7,8 @@ import {
   stripVoiceUnfriendlyFormatting,
   truncateSafe
 } from "../lib/text.js";
-import { buildAliceTts } from "../lib/tts.js";
-import { buildSystemPrompt, detectModeCommand } from "../lib/modes.js";
+import { ALICE_SOUNDS, buildAliceTts } from "../lib/tts.js";
+import { buildSystemPrompt, detectModeAnswerSound, detectModeCommand } from "../lib/modes.js";
 import {
   MAX_HISTORY_MESSAGE_CHARS,
   detectProfileCommand,
@@ -30,6 +30,7 @@ import {
   registerBackgroundPendingTask,
   setCachedSearchResult
 } from "../lib/cache.js";
+import { checkRateLimit, clearRateLimitForTests, extractClientKey } from "../lib/rateLimit.js";
 
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const DEFAULT_FALLBACK_MODEL = "gemini-3.1-flash-lite";
@@ -38,13 +39,16 @@ const DEFAULT_FALLBACK_MODEL = "gemini-3.1-flash-lite";
 const TOTAL_RESPONSE_BUDGET_MS = 3850;
 const SERPER_TIMEOUT_MS = 700;
 const MIN_GEMINI_BUDGET_AFTER_SEARCH_MS = 2500;
-const GEMINI_TIMEOUT_MS = 3600;
+const GEMINI_TIMEOUT_MS = 3650;
 const BACKGROUND_GEMINI_TIMEOUT_MS = 8800; // Fits safely inside Vercel maxDuration: 10s
 const GEMINI_MAX_OUTPUT_TOKENS = 650;
 
 const EXIT_COMMAND_RE = /^(хватит|стоп|выйти|выход|закончить|закройся|завершить|пока|до свидания|все спасибо|всё спасибо)$/i;
 const HELP_COMMAND_RE = /^(помощь|справка|что ты умеешь|что ты можешь|кто ты|инструкция|как пользоваться)$/i;
 const RESET_COMMAND_RE = /^(забудь|забудь все|забудь всё|сбрось контекст|сбросить контекст|очисти историю|новый диалог|начни сначала|смени тему)$/i;
+const REPEAT_COMMAND_RE = /^(повтори|повтори пожалуйста|скажи еще раз|скажи ещё раз|еще раз|ещё раз|что ты сказала|не расслышал|не расслышала)$/i;
+const TIME_QUERY_RE = /^(который час|сколько времени|сколько сейчас времени|текущее время|подскажи время)$/i;
+const DATE_QUERY_RE = /^(какое сегодня число|какая сегодня дата|какой сегодня день|какой сегодня день недели)$/i;
 const CONTINUE_COMMAND_RE = /^(дальше|продолжай|продолжи|еще|ещё|читай дальше|расскажи дальше|готово|ну что)$/i;
 const AFFIRMATIVE_CONTINUE_RE = /^(да|давай|ага|угу|хочу)$/i;
 const ELABORATE_COMMAND_RE = /^(подробнее|расскажи подробнее|объясни подробнее)$/i;
@@ -65,17 +69,18 @@ const SEARCH_INTENT_RE = new RegExp(
 );
 
 const LOCAL_CITY_INTENT_RE = /погод|температур|прогноз|дождь|снег|ветер|градус|пробк|афиш|куда сходить|расписани/i;
-const EXPLICIT_LOCATION_RE = /\b(в|во|на|из|для|по|около|у)\s+[а-яёa-z]{3,}/i;
+const EXPLICIT_LOCATION_RE = /(?:^|\s)(в|во|на|из|для|по|около|у)\s+[а-яёa-z]{3,}/i;
 const FOLLOWUP_QUERY_RE = /^(а |и |ну а |а в |а во |а на |а про |а по |а там|а у |а сколько|а когда|а завтра|а вчера|а сегодня|what about|how about|and in )/i;
 
 function aliceResponse(text, endSession = false, history = [], extra = {}) {
   const fittedText = fitAliceText(text);
   const mode = endSession ? "assistant" : safeMode(extra.mode);
   const sessionState = endSession ? { history: [] } : fitSessionState(history, mode);
+  const soundTag = typeof extra.sound === "string" ? extra.sound : "";
 
   const responsePayload = {
     text: fittedText,
-    tts: typeof extra.tts === "string" && extra.tts ? extra.tts : buildAliceTts(fittedText),
+    tts: typeof extra.tts === "string" && extra.tts ? extra.tts : buildAliceTts(fittedText, soundTag),
     end_session: Boolean(endSession)
   };
 
@@ -98,6 +103,30 @@ function aliceResponse(text, endSession = false, history = [], extra = {}) {
   }
 
   return envelope;
+}
+
+function answerLocalDateTime(cleanCmd, timezone) {
+  const tz = typeof timezone === "string" && timezone.trim() ? timezone.trim() : "Europe/Moscow";
+  const now = new Date();
+  const resolveFmt = options => {
+    try {
+      return new Intl.DateTimeFormat("ru-RU", { timeZone: tz, ...options }).format(now);
+    } catch {
+      return new Intl.DateTimeFormat("ru-RU", { timeZone: "Europe/Moscow", ...options }).format(now);
+    }
+  };
+
+  if (TIME_QUERY_RE.test(cleanCmd)) {
+    const timeStr = resolveFmt({ hour: "2-digit", minute: "2-digit" });
+    return `Сейчас ${timeStr}.`;
+  }
+
+  if (DATE_QUERY_RE.test(cleanCmd)) {
+    const dateStr = resolveFmt({ weekday: "long", day: "numeric", month: "long", year: "numeric" });
+    return `Сегодня ${dateStr}.`;
+  }
+
+  return null;
 }
 
 function isSearchIntent(text, mode = "assistant") {
@@ -299,6 +328,16 @@ async function askGemini({
   const primaryModel = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
   if (!/^[A-Za-z0-9._-]+$/.test(primaryModel)) throw new Error("INVALID_MODEL_NAME");
 
+  // Cache standalone Google Search grounded answers for 7 minutes to save daily grounding quota
+  const groundingCacheKey =
+    useGoogleGrounding && (!history || history.length === 0)
+      ? `grounded:${userProfile?.city || ""}:${userProfile?.style || ""}:${text}`
+      : "";
+  if (groundingCacheKey) {
+    const cachedGrounded = getCachedSearchResult(groundingCacheKey);
+    if (cachedGrounded) return cachedGrounded;
+  }
+
   const contents = safeHistory(history).map(item => ({
     role: item.role,
     parts: [{ text: item.text }]
@@ -391,6 +430,11 @@ async function askGemini({
   if (candidate?.finishReason === "MAX_TOKENS") {
     console.warn("Gemini reached the output token limit.");
   }
+
+  if (groundingCacheKey) {
+    setCachedSearchResult(groundingCacheKey, answer);
+  }
+
   return answer;
 }
 
@@ -477,6 +521,8 @@ function buildDiagnosticsPayload() {
   const primaryModel = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
   const hasSerper = Boolean(process.env.SERPER_API_KEY?.trim());
   const groundingEnabled = process.env.GEMINI_GROUNDING !== "false";
+  const rawLimit = process.env.RATE_LIMIT_PER_MINUTE;
+  const rateLimitPerMinute = rawLimit !== undefined && rawLimit !== "" ? Number(rawLimit) : 25;
 
   return {
     ok: true,
@@ -488,6 +534,7 @@ function buildDiagnosticsPayload() {
       fallbackModel: resolveFallbackModel(primaryModel) || null,
       searchMode: hasSerper ? "serper" : (groundingEnabled ? "gemini_grounding" : "disabled"),
       asyncCacheMode: isUpstashConfigured() ? "upstash_redis" : "memory",
+      rateLimitPerMinute: rateLimitPerMinute > 0 ? rateLimitPerMinute : 0,
       skillIdProtected: Boolean(process.env.ALICE_SKILL_ID?.trim()),
       webhookSecretProtected: Boolean(process.env.WEBHOOK_SECRET?.trim())
     }
@@ -534,7 +581,7 @@ export default async function handler(req, res) {
   // 2. Bare launch greeting
   if (!text) {
     const greetingName = userProfile.name ? `, ${userProfile.name}` : "";
-    const greeting = `Привет${greetingName}! Я могу ответить на вопрос, найти актуальную информацию в интернете или включить режим переводчика, сказочника и викторины. О чём поговорим?`;
+    const greeting = `Привет${greetingName}! Я могу ответить на вопрос, найти актуальную информацию в интернете или включить один из шести режимов — например, переводчика, сказочника или викторину. О чём поговорим?`;
     return res.status(200).json(
       aliceResponse(greeting, false, oldHistory, {
         mode: currentMode,
@@ -559,7 +606,7 @@ export default async function handler(req, res) {
   if (HELP_COMMAND_RE.test(cleanCmd)) {
     const helpText =
       "Я отвечаю на вопросы с помощью нейросети Gemini и ищу свежие новости, погоду или курсы в интернете. " +
-      "Доступные команды: «запомни мой город Москва», «режимы» (переводчик, сказочник, викторина), «дальше» для продолжения длинного ответа, «забудь» для смены темы и «хватит» для выхода.";
+      "Доступные команды: «запомни мой город Москва», «режимы» (переводчик, сказочник, викторина, практика английского, идеи), «повтори», «дальше», «забудь» и «хватит».";
     return res.status(200).json(
       aliceResponse(helpText, false, oldHistory, {
         mode: currentMode,
@@ -574,7 +621,40 @@ export default async function handler(req, res) {
     );
   }
 
-  // 5. Reset conversation history
+  // 5. Repeat last assistant reply ("повтори" / "ещё раз")
+  if (REPEAT_COMMAND_RE.test(cleanCmd)) {
+    const lastModelTurn = [...oldHistory].reverse().find(item => item.role === "model");
+    const repeatText = lastModelTurn
+      ? `Повторяю: ${lastModelTurn.text}`
+      : "Пока нечего повторять — задайте любой вопрос!";
+    return res.status(200).json(
+      aliceResponse(repeatText, false, oldHistory, {
+        mode: currentMode,
+        buttons: buildScreenButtons({
+          hasScreen,
+          mode: currentMode,
+          hasMore: Boolean(oldAppState.more),
+          hasPending: Boolean(oldAppState.pendingId),
+          userProfile
+        })
+      })
+    );
+  }
+
+  // 6. Instant local clock / date answers (0ms, zero API quota)
+  if (currentMode === "assistant") {
+    const localDateTimeReply = answerLocalDateTime(cleanCmd, body?.meta?.timezone);
+    if (localDateTimeReply) {
+      return res.status(200).json(
+        aliceResponse(localDateTimeReply, false, oldHistory, {
+          mode: currentMode,
+          buttons: buildScreenButtons({ hasScreen, mode: currentMode, userProfile })
+        })
+      );
+    }
+  }
+
+  // 7. Reset conversation history
   if (RESET_COMMAND_RE.test(cleanCmd)) {
     return res.status(200).json(
       aliceResponse("Хорошо, начнём с чистого листа. О чём поговорим?", false, [], {
@@ -585,7 +665,7 @@ export default async function handler(req, res) {
     );
   }
 
-  // 6. Voice mode switching (translator, storyteller, quiz, assistant)
+  // 8. Voice mode switching (6 modes + official Alice sound effects)
   const modeAction = detectModeCommand(text);
   if (modeAction) {
     const nextMode = modeAction.type === "switch" ? modeAction.mode : currentMode;
@@ -593,13 +673,14 @@ export default async function handler(req, res) {
     return res.status(200).json(
       aliceResponse(modeAction.reply, false, nextHistory, {
         mode: nextMode,
+        sound: modeAction.sound || "",
         buttons: buildScreenButtons({ hasScreen, mode: nextMode, userProfile }),
         applicationState: hadAppState ? {} : undefined
       })
     );
   }
 
-  // 7. Persistent user profile preferences (city, name, verbosity style)
+  // 9. Persistent user profile preferences (city, name, verbosity style)
   const profileAction = detectProfileCommand(text, userProfile, currentMode);
   if (profileAction) {
     const updatedProfile = profileAction.userStateUpdate
@@ -614,7 +695,7 @@ export default async function handler(req, res) {
     );
   }
 
-  // 8. Continue reading ("дальше") — either async pending answer or paginated long text
+  // 10. Continue reading ("дальше") — either async pending answer or paginated long text
   const isContinueRequest =
     CONTINUE_COMMAND_RE.test(cleanCmd) ||
     ((oldAppState.pendingId || oldAppState.more) && AFFIRMATIVE_CONTINUE_RE.test(cleanCmd));
@@ -622,7 +703,6 @@ export default async function handler(req, res) {
   let effectiveText = text;
 
   if (isContinueRequest) {
-    // 8a. Async pending background generation
     if (oldAppState.pendingId) {
       const pendingOutcome = await consumePendingResult(
         oldAppState.pendingId,
@@ -670,6 +750,7 @@ export default async function handler(req, res) {
         return res.status(200).json(
           aliceResponse(split.text, false, updatedHistory, {
             mode: currentMode,
+            sound: detectModeAnswerSound(currentMode, split.text),
             buttons: buildScreenButtons({
               hasScreen,
               mode: currentMode,
@@ -681,12 +762,10 @@ export default async function handler(req, res) {
         );
       }
 
-      // If pending cache missed (e.g. cold restart without Redis), seamlessly re-run saved question
       if (oldAppState.pendingQ) {
         effectiveText = oldAppState.pendingQ;
       }
     } else if (oldAppState.more) {
-      // 8b. Paginated remainder of a long answer
       const split = splitAliceAnswer(oldAppState.more);
       const nextAppState = split.remainder ? { more: split.remainder } : {};
       return res.status(200).json(
@@ -708,7 +787,23 @@ export default async function handler(req, res) {
     effectiveText = "Расскажи об этом подробнее, с интересными деталями.";
   }
 
-  // 9. Main search + Gemini pipeline (with soft deadline + background waitUntil support)
+  // 11. Per-user sliding-window rate limit before billing external APIs
+  const rateCheck = checkRateLimit(extractClientKey(req, body));
+  if (!rateCheck.allowed) {
+    return res.status(200).json(
+      aliceResponse(
+        "Слишком много запросов подряд. Давайте сделаем паузу на полминуты и продолжим.",
+        false,
+        oldHistory,
+        {
+          mode: currentMode,
+          buttons: buildScreenButtons({ hasScreen, mode: currentMode, userProfile })
+        }
+      )
+    );
+  }
+
+  // 12. Main search + Gemini pipeline (with soft deadline + background waitUntil support)
   try {
     let searchContext = "";
     const needsFreshness = isSearchIntent(effectiveText, currentMode);
@@ -805,6 +900,7 @@ export default async function handler(req, res) {
     return res.status(200).json(
       aliceResponse(split.text, false, history, {
         mode: currentMode,
+        sound: detectModeAnswerSound(currentMode, split.text),
         buttons: buildScreenButtons({
           hasScreen,
           mode: currentMode,
@@ -828,12 +924,15 @@ export default async function handler(req, res) {
 }
 
 export {
+  ALICE_SOUNDS,
   MAX_ALICE_TEXT,
   aliceResponse,
   buildAliceTts,
   buildScreenButtons,
   buildSearchQuery,
+  checkRateLimit,
   clearCachesForTests,
+  clearRateLimitForTests,
   detectModeCommand,
   detectProfileCommand,
   fitAliceText,

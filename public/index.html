@@ -3,15 +3,15 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Яндекс Алиса + Gemini — Статус вебхука</title>
+  <title>Яндекс Алиса + Gemini — Диагностика и Песочница навыка</title>
   <style>
     :root {
-      --bg: #0f1117;
-      --surface: #171b26;
-      --surface-2: #1f2535;
-      --border: #2c344a;
+      --bg: #0d1017;
+      --surface: #161b26;
+      --surface-2: #1e2536;
+      --border: #2b344b;
       --text: #eef1f8;
-      --muted: #98a2b8;
+      --muted: #96a1b8;
       --accent: #7c5cff;
       --accent-hover: #6946ff;
       --ok: #22c55e;
@@ -30,15 +30,15 @@
 
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
-      background: radial-gradient(circle at 50% 0%, #1c1938 0%, var(--bg) 55%);
+      background: radial-gradient(circle at 50% 0%, #1c183b 0%, var(--bg) 52%);
       color: var(--text);
       min-height: 100vh;
       line-height: 1.5;
-      padding: 36px 18px 56px;
+      padding: 32px 16px 56px;
     }
 
     .container {
-      max-width: 780px;
+      max-width: 840px;
       margin: 0 auto;
     }
 
@@ -48,7 +48,7 @@
       justify-content: space-between;
       flex-wrap: wrap;
       gap: 14px;
-      margin-bottom: 24px;
+      margin-bottom: 22px;
     }
 
     .brand {
@@ -70,14 +70,14 @@
     }
 
     h1 {
-      font-size: 1.45rem;
+      font-size: 1.4rem;
       font-weight: 700;
       letter-spacing: -0.02em;
     }
 
     .subtitle {
       color: var(--muted);
-      font-size: 0.92rem;
+      font-size: 0.9rem;
     }
 
     .pill {
@@ -121,17 +121,25 @@
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 16px;
-      padding: 20px 22px;
-      margin-bottom: 18px;
+      padding: 18px 20px;
+      margin-bottom: 16px;
+    }
+
+    .card-header-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 10px;
     }
 
     .card-title {
-      font-size: 0.86rem;
+      font-size: 0.82rem;
       text-transform: uppercase;
       letter-spacing: 0.06em;
       color: var(--muted);
-      font-weight: 600;
-      margin-bottom: 10px;
+      font-weight: 700;
     }
 
     .url-box {
@@ -147,9 +155,9 @@
       background: var(--bg);
       border: 1px solid var(--border);
       border-radius: 10px;
-      padding: 11px 14px;
+      padding: 10px 14px;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 0.92rem;
+      font-size: 0.9rem;
       color: #c4b5fd;
       overflow-x: auto;
       white-space: nowrap;
@@ -159,8 +167,8 @@
       cursor: pointer;
       border: none;
       border-radius: 10px;
-      padding: 11px 16px;
-      font-size: 0.9rem;
+      padding: 10px 15px;
+      font-size: 0.88rem;
       font-weight: 600;
       color: #fff;
       background: var(--accent);
@@ -175,6 +183,11 @@
       transform: translateY(1px);
     }
 
+    button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
     button.secondary {
       background: var(--surface-2);
       border: 1px solid var(--border);
@@ -182,49 +195,213 @@
     }
 
     button.secondary:hover {
-      background: #283044;
+      background: #283148;
+    }
+
+    button.small {
+      padding: 6px 11px;
+      font-size: 0.8rem;
+      border-radius: 8px;
     }
 
     .hint {
-      margin-top: 9px;
-      font-size: 0.85rem;
+      margin-top: 8px;
+      font-size: 0.84rem;
       color: var(--muted);
     }
 
     .grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(225px, 1fr));
-      gap: 14px;
-      margin-bottom: 18px;
+      grid-template-columns: repeat(auto-fit, minmax(185px, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
     }
 
     .stat-card {
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 14px;
-      padding: 16px 18px;
+      padding: 14px 16px;
     }
 
     .stat-label {
-      font-size: 0.82rem;
+      font-size: 0.8rem;
       color: var(--muted);
-      margin-bottom: 6px;
+      margin-bottom: 5px;
     }
 
     .stat-value {
-      font-size: 1rem;
+      font-size: 0.96rem;
       font-weight: 600;
-      margin-bottom: 4px;
+      margin-bottom: 3px;
     }
 
     .stat-sub {
-      font-size: 0.8rem;
+      font-size: 0.78rem;
       color: var(--muted);
+    }
+
+    /* Interactive Sandbox Chat */
+    .sandbox-meta {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+
+    .byte-meter {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      padding: 3px 9px;
+      border-radius: 999px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .auth-row {
+      display: none;
+      gap: 8px;
+      margin-bottom: 10px;
+      flex-wrap: wrap;
+    }
+
+    .auth-row.visible {
+      display: flex;
+    }
+
+    .auth-row input {
+      flex: 1;
+      min-width: 180px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 11px;
+      color: var(--text);
+      font-size: 0.83rem;
+    }
+
+    .chat-log {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      height: 320px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .bubble {
+      max-width: 85%;
+      padding: 10px 13px;
+      border-radius: 13px;
+      font-size: 0.91rem;
+      line-height: 1.45;
+      word-wrap: break-word;
+    }
+
+    .bubble.alice {
+      align-self: flex-start;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-bottom-left-radius: 4px;
+    }
+
+    .bubble.user {
+      align-self: flex-end;
+      background: linear-gradient(135deg, #6d4aff, #4f46e5);
+      color: #fff;
+      border-bottom-right-radius: 4px;
+    }
+
+    .bubble-meta {
+      margin-top: 5px;
+      font-size: 0.74rem;
+      color: var(--muted);
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .tts-preview {
+      margin-top: 5px;
+      padding: 6px 8px;
+      border-radius: 7px;
+      background: rgba(0, 0, 0, 0.28);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.75rem;
+      color: #b7c0d4;
+      display: none;
+    }
+
+    .tts-preview.open {
+      display: block;
+    }
+
+    .link-btn {
+      background: none;
+      border: none;
+      padding: 0;
+      color: #a78bfa;
+      font-size: 0.74rem;
+      font-weight: 500;
+      cursor: pointer;
+    }
+
+    .link-btn:hover {
+      background: none;
+      text-decoration: underline;
+    }
+
+    .chips-row {
+      display: flex;
+      gap: 7px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+      min-height: 8px;
+    }
+
+    .chip {
+      background: rgba(124, 92, 255, 0.14);
+      border: 1px solid rgba(124, 92, 255, 0.38);
+      color: #ddd6fe;
+      padding: 6px 12px;
+      border-radius: 999px;
+      font-size: 0.82rem;
+      font-weight: 500;
+    }
+
+    .chip:hover {
+      background: rgba(124, 92, 255, 0.28);
+    }
+
+    .chat-form {
+      display: flex;
+      gap: 8px;
+    }
+
+    .chat-input {
+      flex: 1;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 11px 14px;
+      color: var(--text);
+      font-size: 0.92rem;
+      outline: none;
+    }
+
+    .chat-input:focus {
+      border-color: var(--accent);
     }
 
     .commands-list {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
       gap: 10px;
       margin-top: 8px;
     }
@@ -233,27 +410,13 @@
       background: var(--surface-2);
       border-radius: 10px;
       padding: 10px 13px;
-      font-size: 0.88rem;
+      font-size: 0.86rem;
     }
 
     .cmd-item strong {
       color: #d8b4fe;
       display: block;
       margin-bottom: 2px;
-    }
-
-    .test-output {
-      margin-top: 12px;
-      padding: 12px 14px;
-      border-radius: 10px;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      font-size: 0.88rem;
-      display: none;
-    }
-
-    .test-output.visible {
-      display: block;
     }
   </style>
 </head>
@@ -268,7 +431,7 @@
         </div>
         <div>
           <h1>Яндекс Алиса + Gemini</h1>
-          <div class="subtitle">Панель диагностики голосового вебхука на Vercel</div>
+          <div class="subtitle">Панель диагностики и интерактивная песочница навыка</div>
         </div>
       </div>
       <div id="overall-badge" class="pill">
@@ -278,16 +441,16 @@
     </div>
 
     <div class="card">
-      <div class="card-title">Webhook URL для Яндекс Диалогов</div>
+      <div class="card-header-row">
+        <div class="card-title">Webhook URL для Яндекс Диалогов</div>
+      </div>
       <div class="url-box">
         <div class="url-code" id="webhook-url">https://ваш-домен.vercel.app/api</div>
         <button id="copy-btn" type="button">Скопировать адрес</button>
-        <button id="test-btn" class="secondary" type="button">Проверить отклик</button>
       </div>
       <div class="hint">
-        Вставьте этот адрес в настройках навыка: <strong>Яндекс Диалоги → Backend → Webhook URL</strong> и включите галочку <strong>«Использовать хранилище данных в навыке»</strong>.
+        Укажите этот адрес в <strong>Яндекс Диалоги → Backend → Webhook URL</strong> и включите опцию <strong>«Использовать хранилище данных в навыке»</strong>.
       </div>
-      <div id="test-result" class="test-output"></div>
     </div>
 
     <div class="grid">
@@ -299,38 +462,71 @@
       <div class="stat-card">
         <div class="stat-label">Поиск в интернете</div>
         <div class="stat-value" id="st-search">—</div>
-        <div class="stat-sub" id="st-search-sub">Актуальные данные и погода</div>
+        <div class="stat-sub" id="st-search-sub">Актуальные данные</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">Долгие ответы (4.5с+)</div>
         <div class="stat-value" id="st-cache">—</div>
-        <div class="stat-sub" id="st-cache-sub">Фоновое додумывание по «дальше»</div>
+        <div class="stat-sub" id="st-cache-sub">Фоновый waitUntil</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">Защита вебхука</div>
+        <div class="stat-label">Защита и лимиты</div>
         <div class="stat-value" id="st-security">—</div>
-        <div class="stat-sub" id="st-security-sub">Фильтрация чужих вызовов</div>
+        <div class="stat-sub" id="st-security-sub">Антиспам и Skill ID</div>
       </div>
     </div>
 
     <div class="card">
-      <div class="card-title">Голосовые команды внутри навыка</div>
+      <div class="card-header-row">
+        <div class="card-title">Песочница диалога с Алисой</div>
+        <div class="sandbox-meta">
+          <span class="byte-meter" id="state-bytes">session_state: 0 / 1024 B</span>
+          <button type="button" class="secondary small" id="toggle-voice-btn">🔇 Озвучка выкл</button>
+          <button type="button" class="secondary small" id="toggle-auth-btn">🔑 Ключи защиты</button>
+          <button type="button" class="secondary small" id="restart-btn">🔄 Новая сессия</button>
+        </div>
+      </div>
+
+      <div class="auth-row" id="auth-row">
+        <input type="text" id="skill-id-input" placeholder="ALICE_SKILL_ID (если задан в Vercel)">
+        <input type="password" id="secret-input" placeholder="WEBHOOK_SECRET (если задан в Vercel)">
+      </div>
+
+      <div class="chat-log" id="chat-log"></div>
+      <div class="chips-row" id="chips-row"></div>
+
+      <form class="chat-form" id="chat-form">
+        <input
+          type="text"
+          class="chat-input"
+          id="chat-input"
+          placeholder="Напишите фразу для Алисы (например: какая погода сегодня или режим викторины)…"
+          autocomplete="off"
+        >
+        <button type="submit" id="send-btn">Отправить</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <div class="card-header-row">
+        <div class="card-title">Голосовые команды и 6 режимов</div>
+      </div>
       <div class="commands-list">
         <div class="cmd-item">
           <strong>«Запомни мой город Новосибирск»</strong>
-          Сохраняет город между разговорами для погоды и событий (также: «меня зовут…», «отвечай кратко / подробно»).
+          Память между разговорами: город, «меня зовут…», «отвечай кратко / подробно».
         </div>
         <div class="cmd-item">
-          <strong>«Режим переводчика / сказочника / викторины»</strong>
-          Переключает роль помощника. Вернуться назад — «обычный режим».
+          <strong>«Режимы» (6 ролей со звуками Алисы)</strong>
+          Обычный, переводчик, детский сказочник, викторина, практика английского, генератор идей.
         </div>
         <div class="cmd-item">
-          <strong>«Дальше» или «Подробнее»</strong>
-          Дочитывает длинный ответ по частям или забирает готовый сложный ответ.
+          <strong>«Дальше» / «Подробнее» / «Повтори»</strong>
+          Дочитывание длинных и фоновых ответов, раскрытие темы или мгновенный повтор реплики.
         </div>
         <div class="cmd-item">
-          <strong>«Забудь» / «Хватит»</strong>
-          «Забудь» очищает историю текущей беседы, а «хватит» завершает работу навыка.
+          <strong>«Который час?» / «Забудь» / «Хватит»</strong>
+          Точное местное время без расхода токенов, очистка контекста и выход из навыка.
         </div>
       </div>
     </div>
@@ -353,6 +549,227 @@
         } catch {
           btn.textContent = "Выделите адрес вручную";
         }
+      });
+
+      // Sandbox state emulating Yandex Dialogs persistence
+      let sessionState = {};
+      let userState = JSON.parse(localStorage.getItem("alice_sandbox_user_state") || "{}");
+      let appState = {};
+      let isNewSession = true;
+      let speakEnabled = false;
+      const clientTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "Europe/Moscow";
+
+      const chatLog = document.getElementById("chat-log");
+      const chipsRow = document.getElementById("chips-row");
+      const chatForm = document.getElementById("chat-form");
+      const chatInput = document.getElementById("chat-input");
+      const sendBtn = document.getElementById("send-btn");
+      const stateBytesEl = document.getElementById("state-bytes");
+      const authRow = document.getElementById("auth-row");
+      const skillIdInput = document.getElementById("skill-id-input");
+      const secretInput = document.getElementById("secret-input");
+
+      document.getElementById("toggle-auth-btn").addEventListener("click", function () {
+        authRow.classList.toggle("visible");
+      });
+
+      document.getElementById("toggle-voice-btn").addEventListener("click", function () {
+        speakEnabled = !speakEnabled;
+        this.textContent = speakEnabled ? "🔊 Озвучка вкл" : "🔇 Озвучка выкл";
+        if (!speakEnabled && window.speechSynthesis) {
+          window.speechSynthesis.cancel();
+        }
+      });
+
+      function updateByteMeter() {
+        const bytes = new TextEncoder().encode(JSON.stringify(sessionState || {})).length;
+        stateBytesEl.textContent = "session_state: " + bytes + " / 1024 B";
+      }
+
+      function speakBrowser(text) {
+        if (!speakEnabled || !window.speechSynthesis || !text) return;
+        try {
+          window.speechSynthesis.cancel();
+          const utter = new SpeechSynthesisUtterance(text);
+          utter.lang = "ru-RU";
+          window.speechSynthesis.speak(utter);
+        } catch {}
+      }
+
+      function appendBubble(role, text, metaInfo) {
+        const wrap = document.createElement("div");
+        wrap.className = "bubble " + (role === "user" ? "user" : "alice");
+
+        const textNode = document.createElement("div");
+        textNode.textContent = text;
+        wrap.appendChild(textNode);
+
+        if (role === "alice" && metaInfo) {
+          const metaRow = document.createElement("div");
+          metaRow.className = "bubble-meta";
+
+          const latencySpan = document.createElement("span");
+          latencySpan.textContent = metaInfo.ms + " мс" + (metaInfo.endSession ? " · сессия завершена" : "");
+          metaRow.appendChild(latencySpan);
+
+          if (metaInfo.tts) {
+            const ttsBtn = document.createElement("button");
+            ttsBtn.type = "button";
+            ttsBtn.className = "link-btn";
+            ttsBtn.textContent = "Показать TTS";
+            const ttsBox = document.createElement("div");
+            ttsBox.className = "tts-preview";
+            ttsBox.textContent = metaInfo.tts;
+            ttsBtn.addEventListener("click", function () {
+              const open = ttsBox.classList.toggle("open");
+              ttsBtn.textContent = open ? "Скрыть TTS" : "Показать TTS";
+            });
+            metaRow.appendChild(ttsBtn);
+            wrap.appendChild(metaRow);
+            wrap.appendChild(ttsBox);
+          } else {
+            wrap.appendChild(metaRow);
+          }
+        }
+
+        chatLog.appendChild(wrap);
+        chatLog.scrollTop = chatLog.scrollHeight;
+      }
+
+      function renderChips(buttons) {
+        chipsRow.innerHTML = "";
+        if (!Array.isArray(buttons)) return;
+        buttons.forEach(function (b) {
+          if (!b || !b.title) return;
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "chip";
+          btn.textContent = b.title;
+          btn.addEventListener("click", function () {
+            sendUtterance(b.title);
+          });
+          chipsRow.appendChild(btn);
+        });
+      }
+
+      async function sendUtterance(utteranceText, isLaunchCall) {
+        const clean = String(utteranceText || "").trim();
+        if (!isLaunchCall && !clean) return;
+
+        if (!isLaunchCall) {
+          appendBubble("user", clean);
+        }
+
+        sendBtn.disabled = true;
+        const t0 = performance.now();
+        try {
+          const headers = { "Content-Type": "application/json" };
+          if (secretInput.value.trim()) {
+            headers["x-webhook-secret"] = secretInput.value.trim();
+          }
+
+          const res = await fetch("/api", {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              version: "1.0",
+              meta: {
+                locale: "ru-RU",
+                timezone: clientTimezone,
+                interfaces: { screen: {} }
+              },
+              session: {
+                new: isLaunchCall ? true : isNewSession,
+                skill_id: skillIdInput.value.trim() || "sandbox-skill",
+                user: { user_id: "sandbox-browser-user" },
+                application: { application_id: "sandbox-browser-app" }
+              },
+              request: {
+                command: isLaunchCall ? "" : clean.toLowerCase(),
+                original_utterance: isLaunchCall ? "" : clean,
+                type: "SimpleUtterance"
+              },
+              state: {
+                session: sessionState,
+                user: userState,
+                application: appState
+              }
+            })
+          });
+
+          const ms = Math.round(performance.now() - t0);
+
+          if (res.status === 403) {
+            authRow.classList.add("visible");
+            appendBubble(
+              "alice",
+              "🔒 Вебхук защищён (403 Forbidden). Введите ваш ALICE_SKILL_ID или WEBHOOK_SECRET в полях выше и нажмите «Новая сессия».",
+              { ms }
+            );
+            return;
+          }
+
+          const data = await res.json();
+          isNewSession = false;
+
+          if (data.session_state !== undefined) {
+            sessionState = data.session_state;
+          }
+          if (data.user_state_update && typeof data.user_state_update === "object") {
+            Object.keys(data.user_state_update).forEach(function (k) {
+              if (data.user_state_update[k] === null) {
+                delete userState[k];
+              } else {
+                userState[k] = data.user_state_update[k];
+              }
+            });
+            localStorage.setItem("alice_sandbox_user_state", JSON.stringify(userState));
+          }
+          if (data.application_state !== undefined) {
+            appState = data.application_state;
+          }
+
+          updateByteMeter();
+
+          const replyText = data?.response?.text || "Пустой ответ";
+          const endSession = Boolean(data?.response?.end_session);
+          appendBubble("alice", replyText, {
+            ms,
+            tts: data?.response?.tts || "",
+            endSession
+          });
+          speakBrowser(replyText);
+          renderChips(data?.response?.buttons || []);
+
+          if (endSession) {
+            sessionState = {};
+            appState = {};
+            isNewSession = true;
+            updateByteMeter();
+          }
+        } catch (err) {
+          appendBubble("alice", "Ошибка соединения с /api: " + err.message, { ms: 0 });
+        } finally {
+          sendBtn.disabled = false;
+        }
+      }
+
+      chatForm.addEventListener("submit", function (e) {
+        e.preventDefault();
+        const val = chatInput.value.trim();
+        if (!val) return;
+        chatInput.value = "";
+        sendUtterance(val, false);
+      });
+
+      document.getElementById("restart-btn").addEventListener("click", function () {
+        chatLog.innerHTML = "";
+        chipsRow.innerHTML = "";
+        sessionState = {};
+        appState = {};
+        isNewSession = true;
+        updateByteMeter();
+        sendUtterance("", true);
       });
 
       const badge = document.getElementById("overall-badge");
@@ -379,12 +796,11 @@
             ? "✅ Ключ подключён"
             : "⚠️ Ключ не задан";
           document.getElementById("st-models").textContent =
-            "Основная: " + (st.primaryModel || "—") +
-            (st.fallbackModel ? " · Резерв: " + st.fallbackModel : "");
+            (st.primaryModel || "—") + (st.fallbackModel ? " → " + st.fallbackModel : "");
 
           const searchMap = {
-            serper: ["✅ Serper Search", "Быстрый поиск Google + кэш 7 мин"],
-            gemini_grounding: ["✅ Поиск Gemini", "Встроенный Google Search без ключа Serper"],
+            serper: ["✅ Serper Search", "Поиск Google + кэш 7 мин"],
+            gemini_grounding: ["✅ Поиск Gemini", "Google Search без ключа Serper"],
             disabled: ["⚪ Отключён", "Только знания модели"]
           };
           const [sTitle, sSub] = searchMap[st.searchMode] || ["—", ""];
@@ -396,48 +812,28 @@
             document.getElementById("st-cache-sub").textContent = "Межсерверный кэш + waitUntil";
           } else {
             document.getElementById("st-cache").textContent = "✅ В памяти (waitUntil)";
-            document.getElementById("st-cache-sub").textContent = "Додумывание ответов до 9 сек";
+            document.getElementById("st-cache-sub").textContent = "Фоновый ответ до 9 сек";
           }
 
+          const limitInfo = st.rateLimitPerMinute ? st.rateLimitPerMinute + " запр/мин" : "без лимита";
           if (st.skillIdProtected || st.webhookSecretProtected) {
             document.getElementById("st-security").textContent = "🔒 Защищён";
-            document.getElementById("st-security-sub").textContent = "Проверка Skill ID / Secret активна";
+            document.getElementById("st-security-sub").textContent = "Skill ID / Secret · " + limitInfo;
+            authRow.classList.add("visible");
           } else {
-            document.getElementById("st-security").textContent = "🔓 Открытый режим";
-            document.getElementById("st-security-sub").textContent = "Можно задать ALICE_SKILL_ID в Vercel";
+            document.getElementById("st-security").textContent = "🛡️ Антиспам активен";
+            document.getElementById("st-security-sub").textContent = "Лимит: " + limitInfo;
           }
+
+          // Start sandbox with initial greeting
+          sendUtterance("", true);
         } catch {
           badge.className = "pill warn";
           badgeText.textContent = "Локальный просмотр";
           document.getElementById("st-gemini").textContent = "Откройте на домене Vercel";
+          appendBubble("alice", "Привет! Это предпросмотр интерфейса. На домене Vercel здесь сразу запускается живой диалог с вашим навыком.", { ms: 1 });
         }
       }
-
-      document.getElementById("test-btn").addEventListener("click", async function () {
-        const out = document.getElementById("test-result");
-        out.className = "test-output visible";
-        out.textContent = "Отправка тестового запуска в /api…";
-        try {
-          const res = await fetch("/api", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              version: "1.0",
-              meta: { interfaces: { screen: {} } },
-              session: { new: true },
-              request: { command: "", original_utterance: "", type: "SimpleUtterance" }
-            })
-          });
-          if (res.status === 403) {
-            out.textContent = "🔒 Вебхук работает и защищён (403 Forbidden для внешних запросов без вашего Skill ID / Secret). Проверяйте навык напрямую через Яндекс Диалоги или колонку!";
-            return;
-          }
-          const json = await res.json();
-          out.textContent = "Ответ навыка: «" + (json?.response?.text || JSON.stringify(json)) + "»";
-        } catch (err) {
-          out.textContent = "Не удалось выполнить запрос: " + err.message;
-        }
-      });
 
       loadDiagnostics();
     })();

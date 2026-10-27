@@ -2,11 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import handler, {
+  ALICE_SOUNDS,
   aliceResponse,
   buildAliceTts,
   buildScreenButtons,
   buildSearchQuery,
   clearCachesForTests,
+  clearRateLimitForTests,
   fitAliceText,
   fitHistoryToStateLimit,
   isSearchIntent,
@@ -42,6 +44,7 @@ const ENV_KEYS = [
   "GEMINI_GROUNDING",
   "ALICE_SKILL_ID",
   "WEBHOOK_SECRET",
+  "RATE_LIMIT_PER_MINUTE",
   "ASYNC_PENDING",
   "SOFT_DEADLINE_MS",
   "UPSTASH_REDIS_REST_URL",
@@ -50,6 +53,7 @@ const ENV_KEYS = [
 
 async function withMockEnvAndFetch(envOverrides, mockFetch, fn) {
   clearCachesForTests();
+  clearRateLimitForTests();
   const originalFetch = globalThis.fetch;
   const savedEnv = {};
 
@@ -230,9 +234,12 @@ test("persistent user_state_update remembers city, name, and style, and injects 
   assert.equal(nameRes.payload.user_state_update?.city, "Новосибирск");
   assert.equal(nameRes.payload.user_state_update?.name, "Андрей");
 
-  // Weather query automatically appends saved city when no location was specified
+  // Weather query automatically appends saved city when no location was specified, but respects explicit cities
   const query = buildSearchQuery("Какая сегодня погода?", [], nameRes.payload.user_state_update);
   assert.match(query, /Новосибирск/);
+
+  const explicitCityQuery = buildSearchQuery("Какая погода сегодня в Сочи?", [], nameRes.payload.user_state_update);
+  assert.doesNotMatch(explicitCityQuery, /Новосибирск/);
 
   // Inspect profile command
   const infoRes = createMockRes();
@@ -611,6 +618,139 @@ test("AbortController DOMException error still maps to friendly timeout message 
         deniedRes
       );
       assert.equal(deniedRes.statusCode, 403);
+    }
+  );
+});
+
+test("grounding citation brackets are stripped and official Alice sound effects play in storyteller/quiz modes", async () => {
+  assert.equal(
+    fitAliceText("Сегодня солнечно [1] и до +20°C [2, 3]."),
+    "Сегодня солнечно и до +20°C."
+  );
+
+  // Storyteller mode switch adds harp sound in TTS
+  const storySwitch = createMockRes();
+  await handler({ method: "POST", body: { request: { command: "детский режим" } } }, storySwitch);
+  assert.equal(storySwitch.payload.session_state.mode, "storyteller");
+  assert.ok(storySwitch.payload.response.tts.startsWith(ALICE_SOUNDS.harp));
+
+  // English coach and brainstorm modes
+  const coachSwitch = createMockRes();
+  await handler({ method: "POST", body: { request: { command: "практика английского" } } }, coachSwitch);
+  assert.equal(coachSwitch.payload.session_state.mode, "coach");
+
+  const brainstormSwitch = createMockRes();
+  await handler({ method: "POST", body: { request: { command: "режим идей" } } }, brainstormSwitch);
+  assert.equal(brainstormSwitch.payload.session_state.mode, "brainstorm");
+
+  // Correct answer in quiz mode plays fanfare sound in TTS
+  await withMockEnvAndFetch(
+    { GEMINI_API_KEY: "gemini-test" },
+    async () => ({
+      ok: true,
+      status: 200,
+      async json() {
+        return { candidates: [{ content: { parts: [{ text: "Правильно! Юпитер — крупнейшая планета. Следующий вопрос: какая планета ближе всех к Солнцу?" }] } }] };
+      }
+    }),
+    async () => {
+      const quizRes = createMockRes();
+      await handler(
+        {
+          method: "POST",
+          body: {
+            request: { command: "юпитер" },
+            state: { session: { mode: "quiz", history: [{ role: "user", text: "космос" }, { role: "model", text: "Какая планета самая большая?" }] } }
+          }
+        },
+        quizRes
+      );
+      assert.ok(quizRes.payload.response.tts.startsWith(ALICE_SOUNDS.gameWin));
+    }
+  );
+});
+
+test("instant local commands ('повтори', 'который час', 'какое сегодня число') respond without external API calls", async () => {
+  let fetchCalled = false;
+  await withMockEnvAndFetch(
+    { GEMINI_API_KEY: "gemini-test" },
+    async () => {
+      fetchCalled = true;
+      throw new Error("External API must not be called for local commands");
+    },
+    async () => {
+      const repeatRes = createMockRes();
+      await handler(
+        {
+          method: "POST",
+          body: {
+            request: { command: "повтори" },
+            state: {
+              session: {
+                history: [
+                  { role: "user", text: "кто открыл пенициллин" },
+                  { role: "model", text: "Пенициллин открыл Александр Флеминг." }
+                ]
+              }
+            }
+          }
+        },
+        repeatRes
+      );
+      assert.match(repeatRes.payload.response.text, /Александр Флеминг/);
+
+      const timeRes = createMockRes();
+      await handler(
+        { method: "POST", body: { meta: { timezone: "Asia/Novosibirsk" }, request: { command: "который час" } } },
+        timeRes
+      );
+      assert.match(timeRes.payload.response.text, /Сейчас \d{2}:\d{2}/);
+
+      const dateRes = createMockRes();
+      await handler(
+        { method: "POST", body: { meta: { timezone: "Asia/Novosibirsk" }, request: { command: "какое сегодня число" } } },
+        dateRes
+      );
+      assert.match(dateRes.payload.response.text, /Сегодня/);
+      assert.equal(fetchCalled, false);
+    }
+  );
+});
+
+test("per-user sliding-window rate limiter protects Gemini quota while keeping local commands responsive", async () => {
+  let geminiCalls = 0;
+  await withMockEnvAndFetch(
+    { GEMINI_API_KEY: "gemini-test", RATE_LIMIT_PER_MINUTE: "2" },
+    async () => {
+      geminiCalls += 1;
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { candidates: [{ content: { parts: [{ text: "Короткий ответ." }] } }] };
+        }
+      };
+    },
+    async () => {
+      const makeReq = text => ({
+        method: "POST",
+        body: { session: { user: { user_id: "user-42" } }, request: { command: text } }
+      });
+
+      const r1 = createMockRes();
+      await handler(makeReq("первый вопрос"), r1);
+      const r2 = createMockRes();
+      await handler(makeReq("второй вопрос"), r2);
+      const r3 = createMockRes();
+      await handler(makeReq("третий вопрос подряд"), r3);
+
+      assert.equal(geminiCalls, 2);
+      assert.match(r3.payload.response.text, /Слишком много запросов/);
+
+      // Local exit command still works even when rate-limited
+      const exitRes = createMockRes();
+      await handler(makeReq("хватит"), exitRes);
+      assert.equal(exitRes.payload.response.end_session, true);
     }
   );
 });
